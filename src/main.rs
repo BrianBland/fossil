@@ -11,7 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(version, about = "Immutable historical Ethereum state prototype")]
+#[command(version, about = "Immutable historical state prototype for EVM chains")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

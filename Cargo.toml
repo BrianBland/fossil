@@ -3,7 +3,7 @@ name = "fossil"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Bootstrap-bounded historical Ethereum state archive prototype"
+description = "Immutable historical state archive prototype for EVM-compatible chains"
 repository = "https://github.com/BrianBland/fossil"
 
 [dependencies]

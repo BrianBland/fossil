@@ -1,8 +1,9 @@
 # Prototype limitations
 
-- There is no direct Reth/ExEx/MDBX reader. No Reth or Base version compatibility is
-  claimed; normalized exporter implementation and version-pinned conformance fixtures
-  are follow-ups.
+- There is no direct execution-client database reader. No client or chain version
+  compatibility is claimed; normalized exporters and version-pinned conformance
+  fixtures are follow-ups. Reth/ExEx/MDBX is one possible adapter, not a core format
+  dependency.
 - Flat values and a supplied state root are stored, but trie nodes, proofs, and
   independent state-root reconstruction are absent. Checksums prove integrity, not
   Ethereum correctness, authenticity, or consensus.
@@ -21,7 +22,7 @@
 - A running server does not poll for new heads. Restart loads the next complete
   generation. There is no multi-region cache coordination.
 - The full catalog is copied into each manifest and lookup scans segment-level index
-  catalogs newest-first. Production Base scale may require checkpoint/delta manifests
+  catalogs newest-first. Production EVM-chain scale requires checkpoint/delta manifests
   and an immutable B-tree/LSM router.
 - No garbage collector, object deletion, publisher signatures, disaster-recovery
   tooling, or mutable-head rollback exists. Configure bucket versioning, retention,

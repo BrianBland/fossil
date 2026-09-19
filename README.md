@@ -1,9 +1,9 @@
 # Fossil
 
 Fossil is a standalone Rust prototype for publishing and serving **bootstrap-bounded,
-immutable historical Ethereum post-state** from normalized exports. It is aimed at
-Base/Reth experiments, but it is not an archive-node replacement and does not yet
-read Reth databases directly.
+immutable historical state for EVM-compatible chains** from normalized exports. Its
+storage format and serving model are execution-client agnostic; it is not yet a full
+archive-node replacement or directly integrated with a node database.
 
 The durable source of truth is a filesystem directory or S3-compatible bucket.
 State segments, indexes, and manifests are immutable and addressed by SHA-256. A
@@ -167,12 +167,12 @@ parent-linked. Account records are address-sorted per block; storage records are
 sorted by `(address, incarnation, slot)`. Hex is lowercase and quantities are
 canonical. Code bytes must match Ethereum Keccak-256 `code_hash`.
 
-Raw Reth storage-v2 changesets are insufficient: they do not alone provide a complete
-forward post-state stream, an initial anchor, bytecode, indexes, or safe
-creation/deletion incarnation semantics. A Base/Reth exporter is a follow-up, not a
-claim of this prototype.
+Fossil is producer-neutral. A client-specific exporter is a follow-up, not a claim of
+this prototype. For example, raw Reth storage-v2 changesets are insufficient on their
+own: they do not provide a complete forward post-state stream, an initial anchor,
+bytecode, indexes, or safe creation/deletion incarnation semantics.
 
-### ExEx integration design
+### Example Reth producer design
 
 A version-pinned Reth ExEx (or dedicated exporter) should:
 
@@ -187,7 +187,7 @@ A version-pinned Reth ExEx (or dedicated exporter) should:
 6. retain observed ancestry through the selected gate and stop on any previously
    published number/hash conflict;
 7. compare exporter fixtures with independent RPC/state expectations for the pinned
-   Base genesis and Reth version.
+   chain genesis and Reth version.
 
 The adapter must not infer these semantics from raw changeset tables without a
 version-specific test.
