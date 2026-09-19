@@ -1,0 +1,52 @@
+{
+  "schema": "fossil-v2-manual-sealed-epochs-summary/1",
+  "claim": "completed deterministic Base-cardinality-shaped sealed-epoch stress test; not semantically complete forward state or production R2 performance",
+  "source_result_sha256": "a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4",
+  "run": {
+    "host": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+    "blocks": 100000,
+    "epoch_blocks": 1000,
+    "epochs_completed": 100,
+    "elapsed_seconds": 228.785909772,
+    "complete": true
+  },
+  "workload_shape": {
+    "account_changes_per_block": 162,
+    "storage_changes_per_block": 851,
+    "unique_accounts_per_epoch": 20614,
+    "unique_storage_keys_per_epoch": 244196,
+    "unique_accounts_across_100_epochs": 940971,
+    "unique_storage_keys_across_100_epochs": 17339777,
+    "cardinality_source": "read-only StaticFileProvider HyperLogLog estimate over Base blocks 51,398,021..51,498,020",
+    "cardinality_summary_sha256": "e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a"
+  },
+  "result": {
+    "immutable_objects": 17456,
+    "logical_immutable_bytes": 1141404991,
+    "estimated_files_including_head": 17457,
+    "data_objects": 3200,
+    "index_objects": 12800,
+    "checkpoint_objects": 1153,
+    "directory_objects": 101,
+    "catalog_objects": 2,
+    "commit_objects": 100
+  },
+  "acceptance_targets": {
+    "elapsed_seconds_max": 600,
+    "objects_excluding_code_max": 35000,
+    "immutable_bytes_max": 2750000000,
+    "status": "passed"
+  },
+  "format": {
+    "router_partitions": 128,
+    "data_partitions": 32,
+    "checkpoint_subshards_per_partition": 8,
+    "codec": "zstd-9"
+  },
+  "caveats": [
+    "The workload reproduces measured change counts and approximate key cardinalities but not authoritative forward EVM state.",
+    "The run used the filesystem backend, not R2 or S3.",
+    "Code blobs, a production exhaustive anchor, network latency, retries, and provider billing are excluded.",
+    "Subsequent bounded-read integrity changes did not alter the epoch physical layout or benchmark generator."
+  ]
+}

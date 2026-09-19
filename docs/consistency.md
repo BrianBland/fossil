@@ -1,36 +1,41 @@
 # Consistency and publication
 
-## Gates
+`finalized` accepts a trusted number/hash. `fixed-offset` verifies an observed tip and
+publishes through `tip - offset`; it is operational lag, not protocol finality.
+Conflicting hashes, gaps, chain/genesis mismatch, or a delta not immediately following
+the committed head fail closed. Identical anchor/delta retries validate their
+checkpoint and return the already-published commit before transition validation, so a
+CAS loser can retry idempotently.
 
-`finalized` accepts an explicit trusted number/hash and only publishes through that
-exact canonical checkpoint. `fixed-offset` verifies an observed input tip and
-publishes through `tip.saturating_sub(offset)`. The latter is an operational lag
-policy, not finality. Consequently, RPC `safe` and `finalized` selectors are rejected
-for fixed-offset publications; only `latest` names that policy head. Fossil inherits
-trust in the source that labels a finalized checkpoint; it does not run consensus.
+## Sealed head-last protocol
 
-Any different hash at or below the committed head, wrong parent, gap, chain/genesis
-mismatch, or delta not immediately following the head is fatal. Existing immutable
-history is never rewritten. Identical content upload and publication retry are
-idempotent.
+V1 retains its frozen segment protocol. V2 publication:
 
-## Manifest-last protocol
+1. reads and verifies the epoch head and fixed commit;
+2. validates input, continuity, gate, and exact code references;
+3. locally groups the complete next bounded epoch by key and block version;
+4. uploads create-only data and compact index-delta partitions;
+5. writes one new active-window directory; after epoch 64 it builds one closing
+   checkpoint partition-by-partition, emits bounded subshards/manifests, the completed
+   directory, and one two-level numeric catalog update;
+6. uploads the fixed-size commit; and
+7. rechecks the gate and CAS-replaces the mutable epoch head.
 
-1. Read and retain the current head version.
-2. Validate input ordering, chain continuity, code, exact gate hash, and previous head.
-3. deterministically encode and hash segment/index objects.
-4. Upload immutable objects with create-only semantics; an existing object is accepted
-   only when its bytes match.
-5. Upload the complete content-addressed manifest.
-6. Recheck the gate and conditionally create/update the mutable head against the
-   retained version.
+Only step 7 changes visibility. An open epoch is never referenced by a head. A failed
+or interrupted writer can leave unreachable immutable objects but cannot expose a
+partial epoch. Publication never deletes objects.
 
-Only step 6 changes reader visibility. A competing publisher causes the conditional
-operation to fail. Orphans from an interruption are harmless and deliberately not
-deleted. Filesystem CAS is guarded by a process-independent lock and atomic rename;
-S3 CAS uses the provider ETag solely as an opaque version token.
+V2 readiness verifies only head and commit. Directories and state objects remain lazy.
+The fixed-size v2 head is read through a hard streaming bound. When fetched, the active
+directory start and completed catalog ranges must match committed metadata exactly;
+a nonempty active directory must end at the published block, while an empty rollover
+directory must start exactly one checked block after it.
+Every request uses one immutable publication snapshot. Refresh ignores an equal head,
+rejects older or unrelated chain/genesis/anchor identity, and accepts any strictly
+newer verified authoritative head even if multiple generations were skipped between
+polls. Audit parents are validated but not traversed. Any refresh failure retains the
+old snapshot; v1 does not support refresh.
 
-A server verifies the committed manifest, mirrors every index, and only then becomes
-ready. Each HTTP request/batch uses one immutable in-process publication. This
-prototype loads a new generation on server restart; automatic background head polling
-and atomic publication swaps remain follow-up work.
+Filesystem CAS uses a process-independent lock and atomic rename. S3-compatible CAS
+uses ETag only as an opaque version token. Provider conditional-write behavior still
+requires deployment-specific smoke testing.

@@ -13,6 +13,7 @@ axum = "0.8"
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 fs2 = "0.4"
+futures-util = "0.3"
 hex = "0.4"
 moka = { version = "0.12", features = ["sync"] }
 object_store = { version = "0.11", features = ["aws"] }
@@ -21,7 +22,7 @@ serde_json = "1"
 sha2 = "0.10"
 sha3 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

@@ -1,34 +1,44 @@
-# Prototype limitations
+# Limitations
 
-- There is no direct execution-client database reader. No client or chain version
-  compatibility is claimed; normalized exporters and version-pinned conformance
-  fixtures are follow-ups. Reth/ExEx/MDBX is one possible adapter, not a core format
-  dependency.
-- Flat values and a supplied state root are stored, but trie nodes, proofs, and
-  independent state-root reconstruction are absent. Checksums prove integrity, not
-  Ethereum correctness, authenticity, or consensus.
-- `eth_getProof`, calls, EVM execution, tracing, blocks, transactions, receipts, logs,
-  filters, and subscriptions are unsupported and return method-not-found.
-- Fixed offset is probabilistic policy, never finality. Finalized checkpoints are
-  trusted external input.
-- A whole input package becomes one zstd segment. Serving fetches whole objects rather
-  than authenticated ranges; large production exports need deterministic frame
-  splitting, sparse routing structures, and measured compaction.
-- The disk cache is verified and persistent but has no byte-budget eviction in this
-  pass. The memory cache is bounded. Indexes are pinned by remaining on disk.
-- Routing indexes are held in memory rather than a rebuildable `redb` database.
-  Startup mirrors them before readiness; very large catalogs require a disk-backed
-  router.
-- A running server does not poll for new heads. Restart loads the next complete
-  generation. There is no multi-region cache coordination.
-- The full catalog is copied into each manifest and lookup scans segment-level index
-  catalogs newest-first. Production EVM-chain scale requires checkpoint/delta manifests
-  and an immutable B-tree/LSM router.
-- No garbage collector, object deletion, publisher signatures, disaster-recovery
-  tooling, or mutable-head rollback exists. Configure bucket versioning, retention,
-  backups, and deletion permissions operationally.
-- Memory/filesystem behavior and the generic conditional object-store adapter are
-  tested in CI. Real AWS S3, R2, and MinIO provider smoke tests are not included, so
-  production interoperability is not yet claimed.
-- The S3 path uses provider conditional requests but cannot prove their contract at
-  startup without a write. Validate the exact provider/client combination before use.
+- V2 is a focused sealed-epoch prototype, not a production archive-node replacement.
+  No direct execution-client exporter or version-pinned chain compatibility suite is
+  included.
+- Supplied flat values/state roots are retained, but trie proofs and independent
+  Ethereum state-root reconstruction are absent. Hashes prove object integrity, not
+  publisher authenticity, consensus, or semantic correctness. Exporter/checkpoint
+  values remain authoritative trusted input; Fossil rejects cross-object and checkpoint
+  time inconsistencies but does not prove Ethereum state roots.
+- `eth_getProof`, blocks, transactions, receipts, logs, filters, subscriptions,
+  tracing, and EVM execution/`eth_call` remain unsupported. Their bounded deferred
+  designs are documented separately.
+- The checked 1,000-block workload is synthetic changeset-shape evidence. The external
+  real 100,000-block result is codec/layout evidence, not end-to-end epoch publication
+  or forward-state validation.
+- The corrected Base-cardinality-shaped 100,000-block run passed its prototype gates
+  in 228.786 seconds with 17,456 objects and 1,141,404,991 bytes. It remains synthetic
+  physical-layout/publication evidence: it does not contain authoritative forward state,
+  a production exhaustive anchor, code traffic, provider latency/retries, or R2 billing.
+- Readers have a bounded verified in-process immutable-object cache but no persistent
+  local index/cache. Correctness and readiness do not depend on cache contents. Each
+  logical lookup has internal object-GET/decoded-byte caps, but process-wide concurrent
+  miss control remains an operator deployment limit.
+- V2 refresh verifies a newer head/commit and accepts skipped generations only when
+  chain/genesis/anchor identity matches and number/generation advance. Lazy object
+  corruption is discovered on access. V1 rejects refresh. `verify --archive-format
+  v2` checks head/commit only; no full-history audit exists.
+- Code CAS objects have a 1 MiB prototype hard limit; chains requiring a larger
+  contract-code policy need a format revision and new resource measurements.
+- V2 EIP-1898 block-hash selectors are rejected until a durable bounded hash-to-number
+  index exists; numeric and tag selectors remain supported.
+- Fixed offset is policy, never protocol finality. Finalized checkpoints are trusted
+  external input.
+- State epochs, index deltas, checkpoints, completed directories/catalogs, and code
+  are durable. No automatic GC, provider inventory, deletion workflow, signature,
+  rollback tool, or disaster-recovery tool is included. Superseded active directories,
+  commits, and orphans require future offline GC after a rollback window.
+- Memory/filesystem and generic conditional object-store behavior are tested locally.
+  Real R2, AWS S3, and MinIO conditional-write/latency tests remain required.
+- Workers are only a future stateless serving target. There is no Worker deployment,
+  log/call serving code, or Durable Object bulk path.
+- V1 remains supported and frozen with its original eager indexes and segment scans.
+  V2 uses a separate epoch head and never falls back across formats.

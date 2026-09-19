@@ -425,6 +425,7 @@ dependencies = [
  "bytes",
  "clap",
  "fs2",
+ "futures-util",
  "hex",
  "moka",
  "object_store",

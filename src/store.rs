@@ -2,11 +2,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs2::FileExt;
+use futures_util::StreamExt;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{GetResult, ObjectStore, PutMode, PutOptions, UpdateVersion};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
@@ -21,8 +23,16 @@ pub struct VersionedBytes {
 #[async_trait]
 pub trait ArchiveStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
+    /// Fetch at most `maximum` bytes, rejecting provider metadata before buffering.
+    async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>>;
     async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()>;
     async fn read_mutable(&self, key: &str) -> Result<Option<VersionedBytes>>;
+    /// Read a mutable object without ever buffering more than `maximum` bytes.
+    async fn read_mutable_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<VersionedBytes>>;
     async fn compare_and_swap(
         &self,
         key: &str,
@@ -117,6 +127,21 @@ impl ArchiveStore for MemoryArchiveStore {
             .ok_or_else(|| anyhow!("object not found: {key}"))
     }
 
+    async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("memory store lock poisoned"))?;
+        let entry = state
+            .entries
+            .get(key)
+            .ok_or_else(|| anyhow!("object not found: {key}"))?;
+        if entry.bytes.len() > maximum {
+            bail!("object metadata length exceeds bounded GET limit");
+        }
+        Ok(entry.bytes.clone())
+    }
+
     async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let mut state = self
             .state
@@ -143,6 +168,27 @@ impl ArchiveStore for MemoryArchiveStore {
                 bytes: entry.bytes.clone(),
                 version: entry.version.to_string(),
             }))
+    }
+
+    async fn read_mutable_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<VersionedBytes>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("memory store lock poisoned"))?;
+        let Some(entry) = state.entries.get(key) else {
+            return Ok(None);
+        };
+        if entry.bytes.len() > maximum {
+            bail!("mutable object exceeds bounded read limit");
+        }
+        Ok(Some(VersionedBytes {
+            bytes: entry.bytes.clone(),
+            version: entry.version.to_string(),
+        }))
     }
 
     async fn compare_and_swap(
@@ -231,6 +277,23 @@ fn create_synced_directory_tree(path: &Path) -> Result<()> {
     sync_directory(path)
 }
 
+fn read_file_bounded(path: &Path, maximum: usize) -> Result<Option<Vec<u8>>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let limit = maximum
+        .checked_add(1)
+        .context("bounded read limit overflow")?;
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    file.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        bail!("object stream exceeds bounded read limit");
+    }
+    Ok(Some(bytes))
+}
+
 fn sync_directory(path: &Path) -> Result<()> {
     OpenOptions::new()
         .read(true)
@@ -246,10 +309,15 @@ impl ArchiveStore for FsArchiveStore {
         std::fs::read(self.path(key)).with_context(|| format!("read object {key}"))
     }
 
+    async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        read_file_bounded(&self.path(key), maximum)?
+            .ok_or_else(|| anyhow!("object not found: {key}"))
+    }
+
     async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let path = self.path(key);
         if path.exists() {
-            let existing = std::fs::read(&path)?;
+            let existing = self.get_bounded(key, bytes.len()).await?;
             if existing == bytes {
                 return Ok(());
             }
@@ -290,6 +358,19 @@ impl ArchiveStore for FsArchiveStore {
         }
     }
 
+    async fn read_mutable_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<VersionedBytes>> {
+        Ok(
+            read_file_bounded(&self.path(key), maximum)?.map(|bytes| VersionedBytes {
+                version: crate::format::Hash32::digest(&bytes).to_string(),
+                bytes,
+            }),
+        )
+    }
+
     async fn compare_and_swap(
         &self,
         key: &str,
@@ -305,7 +386,8 @@ impl ArchiveStore for FsArchiveStore {
             .open(lock_path)?;
         sync_directory(&self.root)?;
         lock.lock_exclusive()?;
-        let current = self.read_mutable(key).await?;
+        let maximum = expected.map_or(bytes.len(), |value| value.bytes.len().max(bytes.len()));
+        let current = self.read_mutable_bounded(key, maximum).await?;
         let matches = match (expected, current.as_ref()) {
             (None, None) => true,
             (Some(expected), Some(current)) => expected.version == current.version,
@@ -337,11 +419,40 @@ impl ObjectArchiveStore {
     }
 }
 
+async fn collect_object_stream_bounded(result: GetResult, maximum: usize) -> Result<Vec<u8>> {
+    let advertised = result.meta.size;
+    if advertised > maximum {
+        bail!("object metadata length exceeds bounded GET limit");
+    }
+    let mut bytes = Vec::with_capacity(advertised.min(maximum));
+    let mut stream = result.into_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let next = bytes
+            .len()
+            .checked_add(chunk.len())
+            .context("object stream length overflow")?;
+        if next > maximum {
+            bail!("object stream exceeds bounded GET limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != advertised {
+        bail!("provider metadata/response length mismatch");
+    }
+    Ok(bytes)
+}
+
 #[async_trait]
 impl ArchiveStore for ObjectArchiveStore {
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let result = self.inner.get(&self.key(key)).await?;
         Ok(result.bytes().await?.to_vec())
+    }
+
+    async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        let result = self.inner.get(&self.key(key)).await?;
+        collect_object_stream_bounded(result, maximum).await
     }
 
     async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -360,7 +471,7 @@ impl ArchiveStore for ObjectArchiveStore {
         match result {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = self.get(key).await?;
+                let existing = self.get_bounded(key, bytes.len()).await?;
                 if existing == bytes {
                     Ok(())
                 } else {
@@ -380,6 +491,26 @@ impl ArchiveStore for ObjectArchiveStore {
                     .clone()
                     .ok_or_else(|| anyhow!("provider returned no ETag for mutable object"))?;
                 let bytes = result.bytes().await?.to_vec();
+                Ok(Some(VersionedBytes { bytes, version }))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn read_mutable_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<VersionedBytes>> {
+        match self.inner.get(&self.key(key)).await {
+            Ok(result) => {
+                let version = result
+                    .meta
+                    .e_tag
+                    .clone()
+                    .ok_or_else(|| anyhow!("provider returned no ETag for mutable object"))?;
+                let bytes = collect_object_stream_bounded(result, maximum).await?;
                 Ok(Some(VersionedBytes { bytes, version }))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -419,6 +550,53 @@ impl ArchiveStore for ObjectArchiveStore {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn bounded_get_rejects_oversized_metadata_before_returning_bytes() {
+        let memory = MemoryArchiveStore::default();
+        memory.put_immutable("large", &[7; 16]).await.unwrap();
+        assert!(memory.get_bounded("large", 8).await.is_err());
+        memory
+            .compare_and_swap("head", None, &[7; 16])
+            .await
+            .unwrap();
+        assert!(memory.read_mutable_bounded("head", 8).await.is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let filesystem = FsArchiveStore {
+            root: root.path().to_path_buf(),
+        };
+        filesystem.put_immutable("large", &[7; 16]).await.unwrap();
+        assert!(filesystem.get_bounded("large", 8).await.is_err());
+        filesystem
+            .compare_and_swap("head", None, &[7; 16])
+            .await
+            .unwrap();
+        assert!(filesystem.read_mutable_bounded("head", 8).await.is_err());
+
+        let object = ObjectArchiveStore {
+            inner: Arc::new(InMemory::new()),
+            prefix: "bounded".to_owned(),
+        };
+        object.put_immutable("large", &[7; 16]).await.unwrap();
+        assert!(object.get_bounded("large", 8).await.is_err());
+        object
+            .compare_and_swap("head", None, &[7; 16])
+            .await
+            .unwrap();
+        assert!(object.read_mutable_bounded("head", 8).await.is_err());
+
+        let inner = InMemory::new();
+        let path = ObjectPath::from("underreported");
+        inner
+            .put(&path, Bytes::from_static(&[9; 16]).into())
+            .await
+            .unwrap();
+        let mut result = inner.get(&path).await.unwrap();
+        result.meta.size = 4;
+        let error = collect_object_stream_bounded(result, 8).await.unwrap_err();
+        assert!(error.to_string().contains("stream exceeds"));
+    }
 
     #[tokio::test]
     async fn object_adapter_uses_conditional_modes() {

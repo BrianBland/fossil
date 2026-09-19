@@ -1,0 +1,146 @@
+{
+  "build": {
+    "profile": "release",
+    "target_arch": "aarch64",
+    "target_os": "macos"
+  },
+  "claim": "checked synthetic Base-shaped sealed-epoch physical-layout evidence; not semantically complete forward state or production object-store performance",
+  "correctness": {
+    "forced_fingerprint_collision_full_key_verified": true,
+    "predecessor_oracle": true,
+    "returned_logical_bytes": 2912
+  },
+  "measurement_provenance": {
+    "base_reth_commit": "5877708b",
+    "base_reth_tag": "base-v2.5.2.6",
+    "caveat": "external real measurements are layout evidence, not semantically complete forward state or end-to-end epoch publication",
+    "finalized_head": 51498020,
+    "hardware": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+    "node_image": "ghcr.io/base/node:v1.3.0-rc.6",
+    "real_100k_hll_cardinality": {
+      "account_rows": 19866464,
+      "caveat": "HLL cardinalities are approximate; they shape synthetic pools but are not exact key lists",
+      "estimated_unique_accounts": 940971,
+      "estimated_unique_address_slot_keys": 17339777,
+      "method": "read-only StaticFileProvider streaming HyperLogLog estimate",
+      "range": "51,398,021..51,498,020",
+      "storage_rows": 88534816,
+      "summary_sha256": "e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a"
+    },
+    "real_100k_layout": {
+      "elapsed_seconds": 67.26,
+      "key_major_zstd_9_bytes": 1504915953,
+      "range": "51,398,021..51,498,020",
+      "summary_sha256": "d35bc9aaf183537f332a6687089f349060d21d9650193e719c196b7438b7f01b"
+    },
+    "rejected_cow_run": {
+      "md0_bytes_when_stopped": 26000000000,
+      "md0_elapsed_when_stopped_seconds": 900,
+      "result": "rejected immutable state-key COW design; unfinished",
+      "tmp_allocated_bytes_approx": 5000000000,
+      "tmp_inode_limit": 1048576,
+      "tmp_logical_bytes_approx": 3000000000,
+      "tmp_objects_before_inode_exhaustion": 929134
+    },
+    "rejected_first_sealed_epoch_scale_run": {
+      "catalog_objects": 2,
+      "checkpoint_objects": 8706,
+      "commit_objects": 100,
+      "data_objects": 6400,
+      "directory_objects": 101,
+      "elapsed_seconds": 505.44,
+      "immutable_bytes": 3297864788,
+      "immutable_objects": 41009,
+      "index_objects": 25600,
+      "result": "runtime passed; object and byte targets failed; input to partition/subshard tuning",
+      "summary_sha256": "ab028cce9f88858725300fa05b82853cbeb037b3d9cb5820778dbd76774cbd93"
+    },
+    "rejected_tuned_high_cardinality_generator_run": {
+      "elapsed_seconds": 425.3685,
+      "immutable_bytes": 3006815546,
+      "immutable_objects": 17456,
+      "result": "completed tuned format run with intentionally rejected over-cardinal synthetic pools; not Base-shaped"
+    },
+    "sampled_at": "2026-09-19"
+  },
+  "point_lookup": {
+    "cache_warming_sequence_remote_bytes": 7764457,
+    "cache_warming_sequence_remote_bytes_per_query": 77644.57,
+    "cache_warming_sequence_remote_gets": 93,
+    "cache_warming_sequence_remote_gets_per_query": 0.93,
+    "maximum_single_query_bytes": 219551,
+    "maximum_single_query_gets": 3,
+    "note": "reader lazily caches verified directory/index/data objects; cache is disposable and non-authoritative",
+    "queries": 100,
+    "repeated_local_ingested_bytes": 0,
+    "repeated_local_ingested_gets": 0
+  },
+  "publication": {
+    "block_metadata_bytes": 46522,
+    "block_metadata_objects": 1,
+    "build_elapsed_seconds": 1.009694333,
+    "build_peak_rss_bytes": null,
+    "catalog_bytes": 0,
+    "catalog_objects": 0,
+    "checkpoint_bytes": 0,
+    "checkpoint_objects": 0,
+    "commit_bytes": 314,
+    "commit_objects": 1,
+    "directory_bytes": 5862,
+    "directory_objects": 1,
+    "index_delta_bytes": 4915911,
+    "index_delta_objects": 128,
+    "put_attempt_bytes": 10558671,
+    "put_attempts": 163,
+    "rss_note": "capture with /usr/bin/time -l; Rust std does not expose portable peak RSS",
+    "state_data_bytes": 5590062,
+    "state_data_objects": 32,
+    "total_immutable_bytes": 10558671,
+    "unique_immutable_objects": 163
+  },
+  "reproduction_command": "cargo run --release -- benchmark --output benchmarks/results/v2-base-shaped-epoch.json",
+  "rollover_63_64": {
+    "catalog_lookup_note": "numeric selection fetches root plus one chunk; completed directory is a separate fetch",
+    "closing_epoch_64": {
+      "block": 63,
+      "checkpoint_partition_manifest_bytes": 293,
+      "checkpoint_partition_manifest_objects": 1,
+      "checkpoint_subshard_bytes": 78,
+      "checkpoint_subshard_objects": 1,
+      "new_checkpoint_bytes": 4992,
+      "new_checkpoint_objects": 3,
+      "peak_partition_entries": 1,
+      "peak_partition_estimated_bytes": 65
+    },
+    "cold_checkpoint_lookup_bytes": 10928,
+    "cold_checkpoint_lookup_gets": 5,
+    "cold_completed_window_lookup_bytes": 372270,
+    "cold_completed_window_lookup_gets": 5,
+    "fixture": "64 one-block epochs, one closing checkpoint, then one checkpoint-backed active-window lookup",
+    "lookup_found": true,
+    "numeric_completed_window_selection_objects_max": 2
+  },
+  "schema": "fossil-v2-sealed-epoch-benchmark/1",
+  "startup": {
+    "bytes": 411,
+    "expected_objects": [
+      "epoch head",
+      "fixed-size commit"
+    ],
+    "gets": 2
+  },
+  "workload": {
+    "account_changes": 162000,
+    "account_changes_per_block": 162,
+    "blocks": 1000,
+    "expected_100k_global_account_pool": 940971,
+    "expected_100k_global_storage_key_pool": 17339777,
+    "generated_unique_accounts": 20614,
+    "generated_unique_storage_keys": 244196,
+    "seed": "0xba5ef05520260003",
+    "storage_changes": 851000,
+    "storage_changes_per_block": 851,
+    "target_local_account_pool": 20614,
+    "target_local_storage_key_pool": 244196
+  }
+}
