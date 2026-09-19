@@ -4,9 +4,8 @@ use common::{anchor_package, finalized, ADDRESS, SLOT_A, SLOT_B};
 use fossil::archive::{self, PublicationGate};
 use fossil::format::{Address, Hash32};
 use fossil::normalized::read_package;
-use fossil::rpc::{handle_rpc, handle_rpc_v2, Publication};
+use fossil::rpc::handle_rpc;
 use fossil::store::{ArchiveStore, MemoryArchiveStore, VersionedBytes};
-use fossil::v2;
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,52 +73,17 @@ impl ArchiveStore for CasLoserStore {
 }
 
 #[tokio::test]
-async fn v2_matches_v1_for_current_rpc_state_semantics() {
-    let v1_store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
-    let v2_store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
-    let package = read_package(&anchor_package()).unwrap();
-    archive::publish(v1_store.clone(), package.clone(), finalized(12))
-        .await
-        .unwrap();
-    v2::publish(v2_store.clone(), package, finalized(12))
-        .await
-        .unwrap();
-
-    let cache = tempfile::tempdir().unwrap();
-    let v1 = Publication::load(v1_store, 1, cache.path().to_path_buf(), 8)
-        .await
-        .unwrap();
-    let v2 = v2::Publication::load(v2_store, 1).await.unwrap();
-    let cases = [
-        json!({"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[ADDRESS,"0xa"]}),
-        json!({"jsonrpc":"2.0","id":2,"method":"eth_getBalance","params":[ADDRESS,"0xb"]}),
-        json!({"jsonrpc":"2.0","id":3,"method":"eth_getTransactionCount","params":[ADDRESS,"latest"]}),
-        json!({"jsonrpc":"2.0","id":4,"method":"eth_getCode","params":[ADDRESS,"0xa"]}),
-        json!({"jsonrpc":"2.0","id":5,"method":"eth_getStorageAt","params":[ADDRESS,SLOT_A,"0xa"]}),
-        json!({"jsonrpc":"2.0","id":6,"method":"eth_getStorageAt","params":[ADDRESS,SLOT_A,"0xc"]}),
-        json!({"jsonrpc":"2.0","id":7,"method":"eth_getStorageAt","params":[ADDRESS,SLOT_B,"0xc"]}),
-        json!({"jsonrpc":"2.0","id":9,"method":"eth_chainId","params":[]}),
-        json!({"jsonrpc":"2.0","id":10,"method":"eth_blockNumber","params":[]}),
-    ];
-    for request in cases {
-        let expected = handle_rpc(&v1, request.clone(), 100).await;
-        let actual = handle_rpc_v2(&v2, request.clone(), 100).await;
-        assert_eq!(actual, expected, "request: {request}");
-    }
-}
-
-#[tokio::test]
-async fn v2_rejects_block_hash_selectors_until_bounded_index_exists() {
+async fn rejects_block_hash_selectors_until_bounded_index_exists() {
     let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
-    v2::publish(
+    archive::publish(
         store.clone(),
         read_package(&anchor_package()).unwrap(),
         finalized(12),
     )
     .await
     .unwrap();
-    let publication = v2::Publication::load(store, 1).await.unwrap();
-    let response = handle_rpc_v2(
+    let publication = archive::Publication::load(store, 1).await.unwrap();
+    let response = handle_rpc(
         &publication,
         json!({"jsonrpc":"2.0","id":8,"method":"eth_getBalance","params":[ADDRESS,{"blockHash":common::hash(10),"requireCanonical":true}]}),
         100,
@@ -133,13 +97,13 @@ async fn v2_rejects_block_hash_selectors_until_bounded_index_exists() {
 }
 
 #[tokio::test]
-async fn v2_anchor_delta_and_cas_loser_retries_are_idempotent() {
+async fn anchor_delta_and_cas_loser_retries_are_idempotent() {
     let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
     let anchor = read_package(&anchor_package()).unwrap();
-    let first = v2::publish(store.clone(), anchor.clone(), finalized(12))
+    let first = archive::publish(store.clone(), anchor.clone(), finalized(12))
         .await
         .unwrap();
-    let retry = v2::publish(store.clone(), anchor, finalized(12))
+    let retry = archive::publish(store.clone(), anchor, finalized(12))
         .await
         .unwrap();
     assert!(!first.idempotent);
@@ -147,41 +111,45 @@ async fn v2_anchor_delta_and_cas_loser_retries_are_idempotent() {
     assert_eq!(retry.commit, first.commit);
 
     let delta = read_package(&delta_with_reemitted_code()).unwrap();
-    let first = v2::publish(store.clone(), delta.clone(), finalized(13))
+    let first = archive::publish(store.clone(), delta.clone(), finalized(13))
         .await
         .unwrap();
-    let retry = v2::publish(store, delta, finalized(13)).await.unwrap();
+    let retry = archive::publish(store, delta, finalized(13)).await.unwrap();
     assert!(!first.idempotent);
     assert!(retry.idempotent);
     assert_eq!(retry.commit, first.commit);
 
     let loser = Arc::new(CasLoserStore::default());
     let package = read_package(&anchor_package()).unwrap();
-    assert!(v2::publish(loser.clone(), package.clone(), finalized(12))
+    assert!(
+        archive::publish(loser.clone(), package.clone(), finalized(12))
+            .await
+            .is_err()
+    );
+    let retry = archive::publish(loser, package, finalized(12))
         .await
-        .is_err());
-    let retry = v2::publish(loser, package, finalized(12)).await.unwrap();
+        .unwrap();
     assert!(retry.idempotent);
 }
 
 #[tokio::test]
-async fn v2_reemitted_code_preserves_old_block_code_metadata() {
+async fn reemitted_code_preserves_old_block_code_metadata() {
     let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
-    v2::publish(
+    archive::publish(
         store.clone(),
         read_package(&anchor_package()).unwrap(),
         finalized(12),
     )
     .await
     .unwrap();
-    v2::publish(
+    archive::publish(
         store.clone(),
         read_package(&delta_with_reemitted_code()).unwrap(),
         finalized(13),
     )
     .await
     .unwrap();
-    let publication = v2::Publication::load(store, 1).await.unwrap();
+    let publication = archive::Publication::load(store, 1).await.unwrap();
     let code = publication
         .code_at(Address::from_str(ADDRESS).unwrap(), 10)
         .await
@@ -190,10 +158,10 @@ async fn v2_reemitted_code_preserves_old_block_code_metadata() {
 }
 
 #[tokio::test]
-async fn v2_fixed_offset_publishes_eligible_prefix_and_rejects_finalized_selector() {
+async fn fixed_offset_publishes_eligible_prefix_and_rejects_finalized_selector() {
     let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
     let package = read_package(&anchor_package()).unwrap();
-    v2::publish(
+    archive::publish(
         store.clone(),
         package,
         PublicationGate::FixedOffset {
@@ -204,9 +172,9 @@ async fn v2_fixed_offset_publishes_eligible_prefix_and_rejects_finalized_selecto
     )
     .await
     .unwrap();
-    let publication = v2::Publication::load(store, 1).await.unwrap();
+    let publication = archive::Publication::load(store, 1).await.unwrap();
     assert_eq!(publication.commit.published_number, 10);
-    let response = handle_rpc_v2(
+    let response = handle_rpc(
         &publication,
         json!({"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[ADDRESS,"finalized"]}),
         100,
@@ -216,13 +184,13 @@ async fn v2_fixed_offset_publishes_eligible_prefix_and_rejects_finalized_selecto
 }
 
 #[tokio::test]
-async fn v2_preserves_tombstones_zeroes_and_incarnations() {
+async fn preserves_tombstones_zeroes_and_incarnations() {
     let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
     let package = read_package(&anchor_package()).unwrap();
-    v2::publish(store.clone(), package, finalized(12))
+    archive::publish(store.clone(), package, finalized(12))
         .await
         .unwrap();
-    let publication = v2::Publication::load(store, 1).await.unwrap();
+    let publication = archive::Publication::load(store, 1).await.unwrap();
     let address = Address::from_str(ADDRESS).unwrap();
     assert!(publication.account_at(address, 11).await.unwrap().is_none());
     assert_eq!(

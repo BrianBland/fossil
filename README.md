@@ -1,57 +1,48 @@
 # Fossil
 
-Fossil is an immutable historical-state archive for EVM-compatible chains. **Hot node
-disks must provide low-latency, high-throughput I/O for sync and execution; finalized
-immutable history does not.** Fossil moves old history to cheap centralized R2/S3
-storage so execution nodes can prune or thin and many disposable RPC readers can
-scale horizontally over one billed-per-GB backend.
+Fossil is an immutable historical-state archive for EVM-compatible chains. Hot nodes
+need low-latency disks for sync and execution; finalized history does not. Fossil lets
+a hot or pruned node continuously export sealed history into one centralized
+R2/S3-compatible object store, while many cheap, disposable readers share that store.
 
-V1 remains readable and tested but frozen. V2 is an incompatible sealed-epoch format,
-selected explicitly with `--archive-format v2`; it never falls back to v1 or the
-rejected, uncommitted state-key COW prototype.
+This repository defines **Fossil on-disk format version 1**: append-only sealed epochs,
+a single mutable head at `chains/<chain-id>/heads/finalized.bin`, immutable
+content-addressed objects, and head-last atomic publication. There is one archive
+format and one CLI path.
 
-## V2 sealed epochs
-
-- Writers buffer and seal append-only epochs of at most 1,000 contiguous blocks. An
-  open epoch is never visible.
-- `SHA256(namespace || full logical key)` fingerprints each changed key; the top seven
-  address/code-hash bits route through 128 compact index-delta partitions into 32
-  Zstd-9 data objects.
-- Index entries contain a 96-bit fingerprint and run pointer. Readers always verify
-  the complete key in the data object, so collisions only add candidate work.
-- One bounded active directory references a base checkpoint and at most 64 epochs.
-  After epoch 64, one partition-local, 8-way-subsharded exact-state checkpoint and a
-  two-level numeric completed-window catalog start the next window.
-- Account tombstones, explicit zero storage, incarnations, trimmed U256 encoding, and
-  separate deduplicated code objects retain existing semantics.
-- Historical balance, nonce, code, storage, chain ID, block number, and numeric/tag
-  selectors share the RPC response layer. V2 block-hash selectors are explicitly
-  unsupported until a durable bounded hash-to-number index exists.
-
-A fixed-size mutable epoch head references one fixed-size immutable commit. Startup is
-exactly a head GET and commit GET; directories, index deltas, checkpoint partitions,
-and data are fetched and verified lazily. A bounded in-process cache is disposable
-and non-authoritative. Every object length and SHA-256 is verified before parsing.
-
-```text
-normalized export -> validate/gate -> seal key-major epoch data + index deltas
-                                     -> rewrite one active directory
-                                     -> fixed-size immutable commit
-                                     -> conditional epoch head (last)
-
-query -> select 64k window -> one router partition -> newest applicable epoch deltas
-      -> exact full-key verification -> base checkpoint pointer/default
-```
-
-The audit parent is never traversed by startup or query. Refresh ignores equal heads,
-rejects older/unrelated heads, and may adopt any strictly newer verified authoritative
-head with matching chain/genesis/anchor even when polling skipped generations.
-
-See [format](docs/format.md), [semantics](docs/semantics.md),
+Start with the illustrated [architecture and storage walkthrough](docs/architecture.md).
+Try the public, read-only [live Base R2/Cloudflare Worker demo](docs/live-demo.md).
+Runtime choices for the native server and the Rust/WASM Cloudflare active-window
+reader are described in [deployment](docs/deployment.md). Worker setup and scope are
+in [`worker/README.md`](worker/README.md). See also [format](docs/format.md),
+[content integrity](docs/integrity.md), [semantics](docs/semantics.md),
 [consistency](docs/consistency.md), [economics](docs/economics.md),
-[Base provenance](docs/base-measurement-provenance.md), [logs design](docs/logs.md),
-[historical call design](docs/historical-eth-call.md), and
+[Base measurement provenance](docs/base-measurement-provenance.md),
+[logs design](docs/logs.md), [historical call design](docs/historical-eth-call.md), and
 [limitations](docs/limitations.md).
+
+## Sealed epochs
+
+- Writers seal at most 1,000 contiguous blocks. An open epoch is never visible.
+- The top seven address/code-hash route bits select one of 128 compact index-delta
+  partitions; four router partitions share each of 32 Zstd-9 data objects.
+- A 96-bit fingerprint identifies candidates, but readers always verify the complete
+  key in the data object. Collisions add work, never false values.
+- One active directory references a base checkpoint and at most 64 sealed epoch
+  descriptors, each covering at most 1,000 blocks. At rollover, the completed
+  directory enters the bounded two-level catalog; its closing exact-state checkpoint
+  becomes the base checkpoint of a new empty active directory.
+- Account tombstones, explicit zero storage, incarnations, trimmed U256 encoding, and
+  deduplicated code objects preserve Ethereum state semantics.
+- Startup is one bounded head GET and one immutable commit GET. Directories, indexes,
+  checkpoints, and data load lazily into a bounded disposable in-process cache.
+- Publication uploads immutable objects and a fixed-size commit first, then changes
+  the head with compare-and-swap. Readers see either the old complete publication or
+  the new complete publication.
+
+Supported RPC methods include historical balance, nonce, code, storage, chain ID, and
+block number with numeric and standard tag selectors. Block-hash selectors are
+rejected until a durable bounded hash-to-number index exists.
 
 ## Quickstart
 
@@ -60,93 +51,95 @@ cargo build --release
 cargo test
 
 STORE=$(mktemp -d)
-cargo run -- archive --archive-format v2 \
+cargo run -- archive \
   --input tests/fixtures/minimal.jsonl --store "$STORE" --chain-id 0x1 \
   --gate finalized \
   --finalized-head 0:0x0000000000000000000000000000000000000000000000000000000000000010
 
-cargo run -- serve --archive-format v2 --store "$STORE" --chain-id 0x1 \
+cargo run -- serve --store "$STORE" --chain-id 0x1 \
   --listen 127.0.0.1:8545 --refresh-seconds 30
-cargo run -- verify --archive-format v2 --store "$STORE" --chain-id 0x1
+cargo run -- verify --store "$STORE" --chain-id 0x1
 ```
 
-`verify` checks only the v2 head/commit startup path; lazy objects verify on access.
-There is no full-history audit command. V1 rejects `--refresh-seconds`.
+`verify` checks the bounded head/commit startup path. Every lazy object verifies its
+length, SHA-256 digest, magic, version, and structural bounds when accessed; there is
+not yet a full-history audit command.
 
 Production exporters should submit complete sealed 1,000-block packages. Smaller
 sealed packages remain accepted for fixtures and tail/checkpoint operation. State at
 block N means post-execution state after N. Missing/deleted accounts and absent
 storage return Ethereum zero values.
 
-## Benchmark
+## Benchmarks
 
-The checked artifact is `benchmarks/results/v2-base-shaped-epoch.json`:
-
-```bash
-cargo run --release -- benchmark \
-  --output benchmarks/results/v2-base-shaped-epoch.json
-```
-
-It reports a Base-shaped 1,000-block epoch's data/index/directory/commit bytes and
-objects, predecessor and forced-collision correctness, startup GETs, cache-warming
-sequence GET/bytes, repeated locally ingested behavior, and a lightweight 64-epoch
-closing-checkpoint rollover. The external real 100,000-block
-codec result remains layout-only evidence.
-
-Manual 100,000-block mode processes and drops one input chunk at a time, writes a
-progress artifact after every epoch, and requires an explicit non-`/tmp` scratch
-location. Canonical system `/tmp` descendants are rejected, at least 8 GiB free is
-required, progress writes are atomic, and every epoch row records elapsed time,
-currently available bytes, and available inodes when `df -Pi` is parseable:
+The checked 1,000-block artifact is
+[`benchmarks/results/base-shaped-epoch.json`](benchmarks/results/base-shaped-epoch.json):
 
 ```bash
 cargo run --release -- benchmark \
-  --manual-blocks 100000 --chunk-blocks 1000 \
-  --scratch-dir /mnt/md0/fossil-epoch-bench \
-  --output benchmarks/results/manual-v2-100000.json
+  --output benchmarks/results/base-shaped-epoch.json
 ```
 
-A read-only Base `StaticFileProvider` HyperLogLog pass over the real 100k range
-estimated 940,971 unique accounts and 17,339,777 unique `(address, slot)` keys. The
-corrected generator preserves 20,614/244,196 local keys per 1,000-block epoch and
-slides those pools to the measured global estimates. HLL is approximate; summary
-SHA-256 is `e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a`.
+The completed Base-cardinality-shaped 100,000-block run sealed 100 epochs in
+**228.786 seconds**, producing **17,456 immutable objects** and **1,141,404,991
+bytes**. Its compact result is
+[`benchmarks/results/base-shaped-epoch-100k.json`](benchmarks/results/base-shaped-epoch-100k.json).
+This is synthetic cardinality-shaped filesystem evidence, not authoritative forward
+EVM state or production R2 performance. It is a retained historical run that predates
+the new month-universe storage-address mapping, not a claimed result from the current
+generator without rerunning 100k. The full progress result has SHA-256
+`a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4`.
 
-The corrected Base-cardinality-shaped 100,000-block run completed all 100 sealed epochs
-in **228.786 seconds**, producing **17,456 immutable objects** and **1,141,404,991
-bytes**. It passed the 10-minute, 35,000-object, and 2.75 GB prototype gates. The
-compact result is checked in at
-`benchmarks/results/v2-base-shaped-epoch-100k.json`; its full progress result has
-SHA-256 `a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4`.
-This remains synthetic cardinality-shaped evidence, not authoritative forward EVM state
-or production R2 performance.
+Real read-only `StaticFileProvider` measurement now covers Base blocks
+50,229,111..51,525,110 (1,296,000 blocks). Across 277,758,377 account rows and
+1,154,636,022 storage rows, HLL estimated 7,956,411 unique accounts and 218,828,772
+unique `(address, slot)` keys (summary
+`42c965456b49243378b4c106c99ee6be50a40611adff5bf8232e1ab3bf5b511e`). Reth
+changeset data plus offsets occupied 93,831,464,168 bytes (summary
+`800390687bcea3ebc1b24dc50589b1708d246af5550b23a561234b4a1b5a1011`).
 
-Earlier high-cardinality and 256/64/16 fanout runs are retained as rejected tuning
-evidence in the provenance document.
+A real month **layout-only** pass over 1,296 1,000-block chunks took 814.453 seconds
+summed across five resumable slices. Block-major Zstd-9 used 24,476,613,098 bytes;
+key-major used 20,030,070,751 bytes (15,455.30 bytes/block, 18.1665% smaller; summary
+`15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c`). These
+measurements do not publish or serve a Fossil archive.
 
-The former immutable state-key COW design is rejected: its exact 100k attempt reached
-929,134 files (about 3 GB logical/5 GB allocated) and exhausted 1,048,576 `/tmp`
-inodes; an md0 rerun accumulated 26 GB and remained unfinished after 15 minutes. This
-is retained as rejected-design evidence, not a v2 result.
+Manual mode accepts a nonzero block count divisible by the chunk size, with
+`--chunk-blocks` in `1..=1000`. The completed deterministic 30-day stress test used
+1,296,000 blocks and 1,000-block chunks. It sealed all 1,296 epochs in **9,449.0865
+seconds (2h37m29s)**, producing 20 completed windows plus 16 active epochs,
+**234,368 immutable objects**, and **23,277,861,710 logical immutable bytes**. Those
+objects include 41,472 data, 165,888 index, 23,060 checkpoint, 1,316 directory, 40
+catalog, and 1,296 commit objects. The compact checked result is
+[`benchmarks/results/base-shaped-month.json`](benchmarks/results/base-shaped-month.json);
+the full progress result has SHA-256
+`c72c2960789cbf6000c42624dacaab03d70939a239747149dc3825d901c977c4`.
 
-## Storage and retention
+This is a filesystem-backed, synthetic Base-cardinality-shaped stress test. It is not
+production R2 performance or billing evidence, and it does not contain authoritative,
+semantically complete forward EVM state, code traffic, or a production exhaustive
+anchor. Manual mode requires an explicit non-`/tmp` scratch directory with at least 8
+GiB free, starts from an empty store, drops each input chunk after sealing, and
+atomically writes progress after every epoch. The deterministic pool formulas are
+tested across all 1,296 epochs, cap IDs at measured global pools, and exercise
+checkpoint/catalog rollover.
 
-R2 Standard is the recommended interactive backend; S3-compatible storage is the
-portable alternative. Workers remain a future stateless serving target. Durable
-Objects are unnecessary for bulk storage/read service. No Worker deployment, log
-serving, historical EVM execution, distributed routing, or automatic GC is included.
+## Storage, trust, and scope
 
-State/data epochs, required deltas/checkpoints/window directories/catalog pages, and
-code are durable. Publication never deletes. Superseded active directories, commits,
-and unreachable interrupted-write objects may be reclaimed only by a future offline
-provider-inventory process after a rollback window; that tooling is not implemented.
+R2 Standard is the recommended interactive backend; an S3-compatible service is the
+portable alternative. The product architecture is one centralized immutable backend,
+not a DHT or federation. State epochs, indexes, checkpoints, directories, catalogs,
+and code are durable. Publication never deletes. Offline inventory and garbage
+collection are future work.
 
-Input remains canonical `fossil-export/1`. The first package is exhaustive and later
-packages are contiguous authoritative post-state deltas. Exported/checkpoint state is
-trusted authoritative input, but Fossil verifies cross-object references, full keys,
-checkpoint boundaries, and pointer version time consistency. SHA-256 proves object
-integrity, not publisher authenticity, consensus, or Ethereum state-root correctness.
-Finality comes from the trusted checkpoint source. Code objects have a 1 MiB prototype
-hard limit.
+The native Tokio/Axum binary is the full JSON-RPC server. The Rust/WASM Cloudflare
+Worker is a bounded, active-window-only reader and read-only object gateway, not a
+second archive. A sparse public [live demo](docs/live-demo.md) serves standard balance,
+nonce, code, storage, chain ID, block-number, and client-version methods directly from
+R2. Logs and historical EVM execution are not implemented.
+
+Input remains canonical `fossil-export/1`. The exporter/finality source is trusted.
+Fossil validates continuity, references, bounds, and content integrity, but SHA-256
+does not prove publisher authenticity, consensus, or the Ethereum state root.
 
 Licensed under MIT.

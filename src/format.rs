@@ -4,9 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 
 pub const SCHEMA: &str = "fossil-export/1";
-pub const MANIFEST_SCHEMA: &str = "fossil-manifest/1";
 pub const SEGMENT_SCHEMA: &str = "fossil-segment/1";
-pub const INDEX_SCHEMA: &str = "fossil-index/1";
 pub const ZERO_HASH: Hash32 = Hash32([0; 32]);
 
 #[derive(
@@ -206,66 +204,4 @@ pub struct Segment {
     pub accounts: Vec<AccountEvent>,
     pub storage: Vec<StorageEvent>,
     pub code: Vec<CodeBlob>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IndexEntry {
-    pub namespace: String,
-    pub key: String,
-    pub min_block: u64,
-    pub max_block: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SegmentIndex {
-    pub schema: String,
-    pub segment: Hash32,
-    pub decoded_sha256: Hash32,
-    pub start_block: u64,
-    pub end_block: u64,
-    pub entries: Vec<IndexEntry>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SegmentDescriptor {
-    pub start_block: u64,
-    pub end_block: u64,
-    pub segment_sha256: Hash32,
-    pub segment_size: u64,
-    pub decoded_sha256: Hash32,
-    pub index_sha256: Hash32,
-    pub index_size: u64,
-    pub encoding: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Manifest {
-    pub schema: String,
-    pub generation: u64,
-    pub chain_id: u64,
-    pub genesis_hash: Hash32,
-    pub anchor_number: u64,
-    pub anchor_hash: Hash32,
-    pub published_number: u64,
-    pub published_hash: Hash32,
-    pub published_state_root: Hash32,
-    pub parent_manifest: Option<Hash32>,
-    pub publication_gate: String,
-    pub input_sha256: Hash32,
-    pub segments: Vec<SegmentDescriptor>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Head {
-    pub schema: u32,
-    #[serde(rename = "chainId")]
-    pub chain_id: String,
-    pub generation: u64,
-    pub manifest: Hash32,
-    pub number: String,
-    pub hash: Hash32,
-}
-
-pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).context("serialize canonical JSON")
 }

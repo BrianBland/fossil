@@ -1,4 +1,4 @@
-# `eth_getLogs` v2 design (deferred)
+# `eth_getLogs` design (deferred)
 
 Log serving is not implemented in this pass. This design is intentionally separate
 from the sealed state-epoch namespace.

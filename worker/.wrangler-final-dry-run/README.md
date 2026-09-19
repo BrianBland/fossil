@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "fossil-r2-gateway" generated at 2026-09-19T23:37:15.700Z.

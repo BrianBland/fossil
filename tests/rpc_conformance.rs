@@ -1,10 +1,11 @@
 mod common;
 
 use common::{anchor_package, finalized, hash, ADDRESS, SLOT_A, VALUE_A};
+use fossil::archive::Publication;
 use fossil::archive::{publish, PublicationGate};
 use fossil::format::Hash32;
 use fossil::normalized::read_package;
-use fossil::rpc::{handle_rpc, Publication};
+use fossil::rpc::handle_rpc;
 use fossil::store::open_store;
 use serde_json::{json, Value};
 
@@ -30,10 +31,7 @@ async fn serves_supported_historical_rpc_and_explicit_errors() {
     )
     .await
     .unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let publication = Publication::load(store, 1, cache.path().to_path_buf(), 8)
-        .await
-        .unwrap();
+    let publication = Publication::load(store, 1).await.unwrap();
 
     assert_eq!(
         call(&publication, "eth_getBalance", json!([ADDRESS, "0xa"])).await["result"],
@@ -43,7 +41,7 @@ async fn serves_supported_historical_rpc_and_explicit_errors() {
         call(
             &publication,
             "eth_getTransactionCount",
-            json!([ADDRESS, {"blockHash":hash(12),"requireCanonical":true}]),
+            json!([ADDRESS, "0xc"]),
         )
         .await["result"],
         "0x2"
@@ -120,10 +118,7 @@ async fn fixed_offset_rejects_safe_and_finalized_tags() {
     )
     .await
     .unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let publication = Publication::load(store, 1, cache.path().to_path_buf(), 8)
-        .await
-        .unwrap();
+    let publication = Publication::load(store, 1).await.unwrap();
 
     assert_eq!(
         call(&publication, "eth_getBalance", json!([ADDRESS, "latest"])).await["result"],

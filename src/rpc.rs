@@ -1,11 +1,8 @@
-use crate::archive::load_head_manifest;
-use crate::cache::SegmentCache;
+use crate::archive;
 use crate::format::{
-    data32, parse_quantity, quantity, quantity_u256, AccountEvent, Address, Hash32, Manifest,
-    SegmentDescriptor, SegmentIndex,
+    data32, parse_quantity, quantity, quantity_u256, AccountEvent, Address, Hash32,
 };
 use crate::store::ArchiveStore;
-use crate::v2;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use axum::extract::State;
@@ -16,159 +13,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-
-pub struct Publication {
-    pub manifest_digest: Hash32,
-    pub manifest: Manifest,
-    descriptors: Vec<(SegmentDescriptor, SegmentIndex)>,
-    cache: SegmentCache,
-}
-
-impl Publication {
-    pub async fn load(
-        store: Arc<dyn ArchiveStore>,
-        chain_id: u64,
-        cache_dir: PathBuf,
-        memory_mib: u64,
-    ) -> Result<Self> {
-        let (_, manifest_digest, manifest) = load_head_manifest(store.as_ref(), chain_id).await?;
-        let cache = SegmentCache::new(store, cache_dir, memory_mib)?;
-        let mut descriptors = Vec::with_capacity(manifest.segments.len());
-        for descriptor in &manifest.segments {
-            let index = cache.mirror_index(descriptor).await?;
-            descriptors.push((descriptor.clone(), index));
-        }
-        Ok(Self {
-            manifest_digest,
-            manifest,
-            descriptors,
-            cache,
-        })
-    }
-
-    pub async fn account_at(&self, address: Address, block: u64) -> Result<Option<AccountEvent>> {
-        self.require_block(block)?;
-        let key = address.to_string();
-        for (descriptor, index) in self.descriptors.iter().rev() {
-            if descriptor.start_block > block || !index_has(index, "account", &key, block) {
-                continue;
-            }
-            let segment = self.cache.segment(descriptor).await?;
-            if let Some(event) = segment
-                .accounts
-                .iter()
-                .rev()
-                .find(|event| event.address == address && event.block <= block)
-            {
-                return Ok(event.exists.then_some(event.clone()));
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn storage_at(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
-        let Some(account) = self.account_at(address, block).await? else {
-            return Ok([0; 32]);
-        };
-        let key = format!("{}:{:016x}:{}", address, account.incarnation, slot);
-        for (descriptor, index) in self.descriptors.iter().rev() {
-            if descriptor.start_block > block || !index_has(index, "storage", &key, block) {
-                continue;
-            }
-            let segment = self.cache.segment(descriptor).await?;
-            if let Some(event) = segment.storage.iter().rev().find(|event| {
-                event.address == address
-                    && event.incarnation == account.incarnation
-                    && event.slot == slot
-                    && event.block <= block
-            }) {
-                return Ok(event.value);
-            }
-        }
-        Ok([0; 32])
-    }
-
-    pub async fn code_at(&self, address: Address, block: u64) -> Result<Vec<u8>> {
-        let Some(account) = self.account_at(address, block).await? else {
-            return Ok(Vec::new());
-        };
-        let key = account.code_hash.to_string();
-        for (descriptor, index) in self.descriptors.iter().rev() {
-            if !index_has(index, "code", &key, block) {
-                continue;
-            }
-            let segment = self.cache.segment(descriptor).await?;
-            if let Some(blob) = segment
-                .code
-                .iter()
-                .find(|blob| blob.code_hash == account.code_hash && blob.first_seen_block <= block)
-            {
-                return Ok(blob.bytes.clone());
-            }
-        }
-        Ok(Vec::new())
-    }
-
-    fn require_block(&self, block: u64) -> Result<()> {
-        if block < self.manifest.anchor_number || block > self.manifest.published_number {
-            bail!("block unavailable");
-        }
-        Ok(())
-    }
-
-    fn block_number_by_hash(&self, hash: Hash32) -> Option<u64> {
-        let suffix = format!(":{hash}");
-        self.descriptors
-            .iter()
-            .flat_map(|(_, index)| &index.entries)
-            .find_map(|entry| {
-                (entry.namespace == "block" && entry.key.ends_with(&suffix))
-                    .then_some(entry.min_block)
-            })
-    }
-
-    pub fn metrics(&self) -> String {
-        let archive_bytes: u64 = self
-            .manifest
-            .segments
-            .iter()
-            .map(|segment| segment.segment_size + segment.index_size)
-            .sum();
-        format!(
-            concat!(
-                "fossil_publication_generation {}\n",
-                "fossil_published_block {}\n",
-                "fossil_archive_segments {}\n",
-                "fossil_archive_object_bytes {}\n",
-                "{}"
-            ),
-            self.manifest.generation,
-            self.manifest.published_number,
-            self.manifest.segments.len(),
-            archive_bytes,
-            self.cache.stats.render()
-        )
-    }
-}
-
-fn index_has(index: &SegmentIndex, namespace: &str, key: &str, block: u64) -> bool {
-    index
-        .entries
-        .binary_search_by(|entry| {
-            entry
-                .namespace
-                .as_str()
-                .cmp(namespace)
-                .then_with(|| entry.key.as_str().cmp(key))
-        })
-        .ok()
-        .and_then(|position| index.entries.get(position))
-        .is_some_and(|entry| entry.min_block <= block && index.start_block <= block)
-}
 
 #[async_trait]
 pub trait RpcBackend: Send + Sync {
@@ -187,47 +34,7 @@ pub trait RpcBackend: Send + Sync {
 }
 
 #[async_trait]
-impl RpcBackend for Publication {
-    fn chain_id(&self) -> u64 {
-        self.manifest.chain_id
-    }
-    fn generation(&self) -> u64 {
-        self.manifest.generation
-    }
-    fn anchor_number(&self) -> u64 {
-        self.manifest.anchor_number
-    }
-    fn published_number(&self) -> u64 {
-        self.manifest.published_number
-    }
-    fn publication_digest(&self) -> Hash32 {
-        self.manifest_digest
-    }
-    fn finalized(&self) -> bool {
-        !self.manifest.publication_gate.starts_with("fixed-offset:")
-    }
-    fn supports_block_hash_selector(&self) -> bool {
-        true
-    }
-    fn metrics(&self) -> String {
-        Publication::metrics(self)
-    }
-    async fn account_at(&self, address: Address, block: u64) -> Result<Option<AccountEvent>> {
-        Publication::account_at(self, address, block).await
-    }
-    async fn storage_at(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
-        Publication::storage_at(self, address, slot, block).await
-    }
-    async fn code_at(&self, address: Address, block: u64) -> Result<Vec<u8>> {
-        Publication::code_at(self, address, block).await
-    }
-    async fn block_number_by_hash(&self, hash: Hash32) -> Result<Option<u64>> {
-        Ok(Publication::block_number_by_hash(self, hash))
-    }
-}
-
-#[async_trait]
-impl RpcBackend for v2::Publication {
+impl RpcBackend for archive::Publication {
     fn chain_id(&self) -> u64 {
         self.commit.chain_id
     }
@@ -250,26 +57,26 @@ impl RpcBackend for v2::Publication {
         false
     }
     fn metrics(&self) -> String {
-        format!("fossil_publication_generation {}\nfossil_published_block {}\nfossil_archive_format 2\n", self.commit.generation, self.commit.published_number)
+        format!("fossil_publication_generation {}\nfossil_published_block {}\nfossil_archive_format 1\n", self.commit.generation, self.commit.published_number)
     }
     async fn account_at(&self, address: Address, block: u64) -> Result<Option<AccountEvent>> {
-        v2::Publication::account_at(self, address, block).await
+        archive::Publication::account_at(self, address, block).await
     }
     async fn storage_at(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
-        v2::Publication::storage_at(self, address, slot, block).await
+        archive::Publication::storage_at(self, address, slot, block).await
     }
     async fn code_at(&self, address: Address, block: u64) -> Result<Vec<u8>> {
-        v2::Publication::code_at(self, address, block).await
+        archive::Publication::code_at(self, address, block).await
     }
     async fn block_number_by_hash(&self, hash: Hash32) -> Result<Option<u64>> {
-        v2::Publication::block_number_by_hash(self, hash).await
+        archive::Publication::block_number_by_hash(self, hash).await
     }
 }
 
 #[derive(Clone)]
 enum PublicationSource {
     Static(Arc<dyn RpcBackend>),
-    RefreshingV2(Arc<RwLock<Arc<v2::Publication>>>),
+    Refreshing(Arc<RwLock<Arc<archive::Publication>>>),
 }
 
 #[derive(Clone)]
@@ -282,7 +89,7 @@ impl RpcState {
     fn snapshot(&self) -> Arc<dyn RpcBackend> {
         match &self.publication {
             PublicationSource::Static(publication) => publication.clone(),
-            PublicationSource::RefreshingV2(publication) => publication
+            PublicationSource::Refreshing(publication) => publication
                 .read()
                 .expect("publication lock poisoned")
                 .clone(),
@@ -302,44 +109,39 @@ struct Request {
 }
 
 pub async fn serve(
-    publication: Arc<Publication>,
+    publication: Arc<archive::Publication>,
     listen: SocketAddr,
     batch_limit: usize,
 ) -> Result<()> {
     serve_backend(publication, listen, batch_limit).await
 }
 
-pub async fn serve_v2(
-    publication: Arc<v2::Publication>,
-    listen: SocketAddr,
-    batch_limit: usize,
-) -> Result<()> {
-    serve_backend(publication, listen, batch_limit).await
-}
-
-fn validate_v2_refresh(current: &v2::Publication, candidate: &v2::Publication) -> Result<bool> {
+fn validate_refresh(
+    current: &archive::Publication,
+    candidate: &archive::Publication,
+) -> Result<bool> {
     if candidate.head.commit == current.head.commit {
         return Ok(false);
     }
     if candidate.commit.generation <= current.commit.generation
         || candidate.commit.published_number <= current.commit.published_number
     {
-        bail!("v2 refresh would roll back or fail to advance the publication");
+        bail!("refresh would roll back or fail to advance the publication");
     }
     if candidate.commit.chain_id != current.commit.chain_id
         || candidate.commit.genesis_hash != current.commit.genesis_hash
         || candidate.commit.anchor_number != current.commit.anchor_number
         || candidate.commit.anchor_hash != current.commit.anchor_hash
     {
-        bail!("v2 refresh publication identity is unrelated to the current chain");
+        bail!("refresh publication identity is unrelated to the current chain");
     }
     // The authoritative mutable head may advance more than once between polls. Its
     // audit parent is not traversed by readers, so skipped generations are valid.
     Ok(true)
 }
 
-pub async fn serve_v2_refreshing(
-    publication: Arc<v2::Publication>,
+pub async fn serve_refreshing(
+    publication: Arc<archive::Publication>,
     store: Arc<dyn ArchiveStore>,
     chain_id: u64,
     interval: Duration,
@@ -356,26 +158,26 @@ pub async fn serve_v2_refreshing(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match v2::Publication::load(store.clone(), chain_id).await {
+            match archive::Publication::load(store.clone(), chain_id).await {
                 Ok(candidate) => {
                     let mut current = refresh_target.write().expect("publication lock poisoned");
-                    match validate_v2_refresh(current.as_ref(), &candidate) {
+                    match validate_refresh(current.as_ref(), &candidate) {
                         Ok(true) => *current = Arc::new(candidate),
                         Ok(false) => {}
                         Err(error) => {
-                            tracing::warn!(%error, "v2 refresh rejected; retaining previous publication")
+                            tracing::warn!(%error, "refresh rejected; retaining previous publication")
                         }
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "v2 refresh rejected; retaining previous publication")
+                    tracing::warn!(%error, "refresh rejected; retaining previous publication")
                 }
             }
         }
     });
     serve_state(
         RpcState {
-            publication: PublicationSource::RefreshingV2(shared),
+            publication: PublicationSource::Refreshing(shared),
             batch_limit,
         },
         listen,
@@ -426,12 +228,8 @@ async fn rpc_handler(State(state): State<RpcState>, Json(value): Json<Value>) ->
     Json(handle_rpc_backend(publication.as_ref(), value, state.batch_limit).await)
 }
 
-pub async fn handle_rpc(publication: &Publication, value: Value, batch_limit: usize) -> Value {
-    handle_rpc_backend(publication, value, batch_limit).await
-}
-
-pub async fn handle_rpc_v2(
-    publication: &v2::Publication,
+pub async fn handle_rpc(
+    publication: &archive::Publication,
     value: Value,
     batch_limit: usize,
 ) -> Value {
@@ -479,7 +277,7 @@ async fn resolve_selector(publication: &dyn RpcBackend, selector: &Value) -> Res
                 number
             } else {
                 if !publication.supports_block_hash_selector() {
-                    bail!("v2 block-hash selectors are unsupported until a bounded durable hash index exists");
+                    bail!("block-hash selectors are unsupported until a bounded durable hash index exists");
                 }
                 let hash = object
                     .get("blockHash")
@@ -655,43 +453,8 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 mod tests {
     use super::*;
     use crate::archive::PublicationGate;
-    use crate::format::{IndexEntry, INDEX_SCHEMA};
     use crate::normalized::read_package;
     use crate::store::{ArchiveStore, MemoryArchiveStore};
-
-    #[test]
-    fn sorted_index_point_lookup_uses_exact_key() {
-        let index = SegmentIndex {
-            schema: INDEX_SCHEMA.to_owned(),
-            segment: Hash32([1; 32]),
-            decoded_sha256: Hash32([2; 32]),
-            start_block: 10,
-            end_block: 20,
-            entries: vec![
-                IndexEntry {
-                    namespace: "account".to_owned(),
-                    key: "a".to_owned(),
-                    min_block: 10,
-                    max_block: 20,
-                },
-                IndexEntry {
-                    namespace: "account".to_owned(),
-                    key: "b".to_owned(),
-                    min_block: 12,
-                    max_block: 20,
-                },
-                IndexEntry {
-                    namespace: "storage".to_owned(),
-                    key: "a".to_owned(),
-                    min_block: 10,
-                    max_block: 20,
-                },
-            ],
-        };
-        assert!(index_has(&index, "account", "b", 12));
-        assert!(!index_has(&index, "account", "b", 11));
-        assert!(!index_has(&index, "account", "c", 20));
-    }
 
     fn package(mode: &str, block: u8) -> Vec<u8> {
         let hash = Hash32([block + 1; 32]);
@@ -716,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_ignores_equal_accepts_skips_and_rejects_rollback_or_unrelated() {
         let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
-        v2::publish(
+        archive::publish(
             store.clone(),
             read_package(&package("anchor", 0)).unwrap(),
             PublicationGate::Finalized {
@@ -726,10 +489,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = v2::Publication::load(store.clone(), 1).await.unwrap();
-        assert!(!validate_v2_refresh(&first, &first).unwrap());
+        let first = archive::Publication::load(store.clone(), 1).await.unwrap();
+        assert!(!validate_refresh(&first, &first).unwrap());
 
-        v2::publish(
+        archive::publish(
             store.clone(),
             read_package(&package("delta", 1)).unwrap(),
             PublicationGate::Finalized {
@@ -739,22 +502,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = v2::Publication::load(store, 1).await.unwrap();
-        assert!(validate_v2_refresh(&first, &second).unwrap());
-        assert!(validate_v2_refresh(&second, &first).is_err());
+        let second = archive::Publication::load(store, 1).await.unwrap();
+        assert!(validate_refresh(&first, &second).unwrap());
+        assert!(validate_refresh(&second, &first).is_err());
 
         let mut unrelated = second.clone();
         unrelated.commit.genesis_hash = Hash32([99; 32]);
-        assert!(validate_v2_refresh(&first, &unrelated).is_err());
+        assert!(validate_refresh(&first, &unrelated).is_err());
         let mut skipped = second.clone();
         skipped.commit.generation = 3;
         skipped.commit.published_number = 2;
         skipped.head.generation = 3;
         skipped.head.number = 2;
-        skipped.commit.parent = v2::ObjectRef {
+        skipped.commit.parent = archive::ObjectRef {
             digest: Hash32([88; 32]),
             length: 1,
         };
-        assert!(validate_v2_refresh(&first, &skipped).unwrap());
+        assert!(validate_refresh(&first, &skipped).unwrap());
     }
 }

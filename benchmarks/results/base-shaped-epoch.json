@@ -14,8 +14,9 @@
     "base_reth_commit": "5877708b",
     "base_reth_tag": "base-v2.5.2.6",
     "caveat": "external real measurements are layout evidence, not semantically complete forward state or end-to-end epoch publication",
-    "finalized_head": 51498020,
     "hardware": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+    "hundred_k_finalized_head": 51498020,
+    "month_finalized_head": 51525110,
     "node_image": "ghcr.io/base/node:v1.3.0-rc.6",
     "real_100k_hll_cardinality": {
       "account_rows": 19866464,
@@ -32,6 +33,36 @@
       "key_major_zstd_9_bytes": 1504915953,
       "range": "51,398,021..51,498,020",
       "summary_sha256": "d35bc9aaf183537f332a6687089f349060d21d9650193e719c196b7438b7f01b"
+    },
+    "real_month_hll_cardinality": {
+      "account_rows": 277758377,
+      "blocks": 1296000,
+      "caveat": "HLL cardinalities are approximate; they shape synthetic pools but are not exact key lists",
+      "estimated_unique_accounts": 7956411,
+      "estimated_unique_address_slot_keys": 218828772,
+      "method": "read-only StaticFileProvider streaming HyperLogLog estimate",
+      "range": "50,229,111..51,525,110",
+      "storage_rows": 1154636022,
+      "summary_sha256": "42c965456b49243378b4c106c99ee6be50a40611adff5bf8232e1ab3bf5b511e"
+    },
+    "real_month_layout_only": {
+      "block_major_zstd_9_bytes": 24476613098,
+      "caveat": "layout-only processing of real changesets; not an end-to-end sealed-epoch archive run",
+      "chunks": 1296,
+      "key_major_bytes_per_block": 15455.3,
+      "key_major_percent_smaller_than_block_major": 18.1665,
+      "key_major_zstd_9_bytes": 20030070751,
+      "range": "50,229,111..51,525,110",
+      "resumable_slices": 5,
+      "summary_sha256": "15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c",
+      "summed_elapsed_seconds": 814.453
+    },
+    "real_month_reth_changesets": {
+      "account_data_and_offsets_bytes": 11759303278,
+      "range": "50,229,111..51,525,110",
+      "storage_data_and_offsets_bytes": 82072160890,
+      "summary_sha256": "800390687bcea3ebc1b24dc50589b1708d246af5550b23a561234b4a1b5a1011",
+      "total_data_and_offsets_bytes": 93831464168
     },
     "rejected_cow_run": {
       "md0_bytes_when_stopped": 26000000000,
@@ -64,11 +95,11 @@
     "sampled_at": "2026-09-19"
   },
   "point_lookup": {
-    "cache_warming_sequence_remote_bytes": 7764457,
-    "cache_warming_sequence_remote_bytes_per_query": 77644.57,
+    "cache_warming_sequence_remote_bytes": 7845385,
+    "cache_warming_sequence_remote_bytes_per_query": 78453.85,
     "cache_warming_sequence_remote_gets": 93,
     "cache_warming_sequence_remote_gets_per_query": 0.93,
-    "maximum_single_query_bytes": 219551,
+    "maximum_single_query_bytes": 223401,
     "maximum_single_query_gets": 3,
     "note": "reader lazily caches verified directory/index/data objects; cache is disposable and non-authoritative",
     "queries": 100,
@@ -78,7 +109,7 @@
   "publication": {
     "block_metadata_bytes": 46522,
     "block_metadata_objects": 1,
-    "build_elapsed_seconds": 1.009694333,
+    "build_elapsed_seconds": 1.108434375,
     "build_peak_rss_bytes": null,
     "catalog_bytes": 0,
     "catalog_objects": 0,
@@ -90,15 +121,15 @@
     "directory_objects": 1,
     "index_delta_bytes": 4915911,
     "index_delta_objects": 128,
-    "put_attempt_bytes": 10558671,
+    "put_attempt_bytes": 10654685,
     "put_attempts": 163,
     "rss_note": "capture with /usr/bin/time -l; Rust std does not expose portable peak RSS",
-    "state_data_bytes": 5590062,
+    "state_data_bytes": 5686076,
     "state_data_objects": 32,
-    "total_immutable_bytes": 10558671,
+    "total_immutable_bytes": 10654685,
     "unique_immutable_objects": 163
   },
-  "reproduction_command": "cargo run --release -- benchmark --output benchmarks/results/v2-base-shaped-epoch.json",
+  "reproduction_command": "cargo run --release -- benchmark --output benchmarks/results/base-shaped-epoch.json",
   "rollover_63_64": {
     "catalog_lookup_note": "numeric selection fetches root plus one chunk; completed directory is a separate fetch",
     "closing_epoch_64": {
@@ -120,7 +151,7 @@
     "lookup_found": true,
     "numeric_completed_window_selection_objects_max": 2
   },
-  "schema": "fossil-v2-sealed-epoch-benchmark/1",
+  "schema": "fossil-sealed-epoch-benchmark/1",
   "startup": {
     "bytes": 411,
     "expected_objects": [
@@ -135,6 +166,8 @@
     "blocks": 1000,
     "expected_100k_global_account_pool": 940971,
     "expected_100k_global_storage_key_pool": 17339777,
+    "expected_month_global_account_pool": 7956411,
+    "expected_month_global_storage_key_pool": 218828772,
     "generated_unique_accounts": 20614,
     "generated_unique_storage_keys": 244196,
     "seed": "0xba5ef05520260003",

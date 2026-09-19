@@ -1,5 +1,5 @@
 {
-  "schema": "fossil-v2-manual-sealed-epochs-summary/1",
+  "schema": "fossil-manual-sealed-epochs-summary/1",
   "claim": "completed deterministic Base-cardinality-shaped sealed-epoch stress test; not semantically complete forward state or production R2 performance",
   "source_result_sha256": "a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4",
   "run": {
@@ -18,7 +18,8 @@
     "unique_accounts_across_100_epochs": 940971,
     "unique_storage_keys_across_100_epochs": 17339777,
     "cardinality_source": "read-only StaticFileProvider HyperLogLog estimate over Base blocks 51,398,021..51,498,020",
-    "cardinality_summary_sha256": "e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a"
+    "cardinality_summary_sha256": "e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a",
+    "generator_note": "historical completed run predating month-universe storage-address mapping; retained measured evidence, not a result from the current generator without rerun"
   },
   "result": {
     "immutable_objects": 17456,

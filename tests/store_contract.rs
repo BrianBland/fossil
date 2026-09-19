@@ -10,14 +10,17 @@ async fn assert_store_contract(store: Arc<dyn ArchiveStore>) {
         .await
         .is_err());
 
-    store.compare_and_swap("head", None, b"v1").await.unwrap();
+    store
+        .compare_and_swap("head", None, b"first")
+        .await
+        .unwrap();
     assert!(store
         .compare_and_swap("head", None, b"again")
         .await
         .is_err());
     let first = store.read_mutable("head").await.unwrap().unwrap();
     store
-        .compare_and_swap("head", Some(&first), b"v2")
+        .compare_and_swap("head", Some(&first), b"second")
         .await
         .unwrap();
     assert!(store
@@ -26,7 +29,7 @@ async fn assert_store_contract(store: Arc<dyn ArchiveStore>) {
         .is_err());
     assert_eq!(
         store.read_mutable("head").await.unwrap().unwrap().bytes,
-        b"v2"
+        b"second"
     );
 }
 
@@ -51,6 +54,6 @@ async fn filesystem_backend_contract_and_reopen() {
     assert_eq!(reopened.get("objects/value").await.unwrap(), b"one");
     assert_eq!(
         reopened.read_mutable("head").await.unwrap().unwrap().bytes,
-        b"v2"
+        b"second"
     );
 }

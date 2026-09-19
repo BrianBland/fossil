@@ -1,0 +1,29 @@
+[package]
+name = "fossil-worker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures-util = "0.3.31"
+hex = "0.4.3"
+ruzstd = "0.9.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+sha3 = "0.10.8"
+worker = "0.8.6"
+
+[dev-dependencies]
+base64 = "0.22.1"
+futures = "0.3.31"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

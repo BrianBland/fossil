@@ -1,8 +1,9 @@
 # Base measurement provenance
 
-These retained summaries were sampled on **2026-09-19** from finalized Base head
-**51,498,020**. The machine was `devbox` with **32 cores, 128 GiB RAM, and a 15 TiB
-RAID**. The node image was `ghcr.io/base/node:v1.3.0-rc.6`; its Base Reth source was
+These retained summaries were sampled on **2026-09-19**. The 100,000-block evidence
+ends at finalized Base head **51,498,020**; the month evidence ends at finalized Base
+head **51,525,110**. The machine was `devbox` with **32 cores, 128 GiB RAM, and a
+15 TiB RAID**. The node image was `ghcr.io/base/node:v1.3.0-rc.6`; its Base Reth source was
 tag `base-v2.5.2.6`, commit `5877708b`.
 
 ## Extraction methodology
@@ -11,9 +12,11 @@ Block and receipt shape came from canonical RPC block/receipt responses at the s
 finalized head. State changeset shape and physical sizes came from a read-only Reth
 `StaticFileProvider` using the state changeset offset/data files (`csoff`/`off`). No
 node database was mutated. The 100,000-block layout run processed 100 real 1,000-block
-chunks and discarded each decoded chunk after encoding its layout outputs.
+chunks and discarded each decoded chunk after encoding its layout outputs. The month
+layout pass processed 1,296 real 1,000-block chunks in five resumable slices; its
+reported elapsed time is the sum of those slices.
 
-The retained compact summaries have these SHA-256 digests:
+The retained summaries and full month progress result have these SHA-256 digests:
 
 | Summary | SHA-256 |
 |---|---|
@@ -22,6 +25,10 @@ The retained compact summaries have these SHA-256 digests:
 | codec sizes | `866a8ff20d4baf36135c5d8ce9795c84e58288557023c047b2930db0cfa8951a` |
 | codec timing | `0017d8d0ca6939742280b66e3d5d5644cab2410a628145fe4bf618a2f67cc957` |
 | 100k layout | `d35bc9aaf183537f332a6687089f349060d21d9650193e719c196b7438b7f01b` |
+| month HLL | `42c965456b49243378b4c106c99ee6be50a40611adff5bf8232e1ab3bf5b511e` |
+| month Reth physical changesets | `800390687bcea3ebc1b24dc50589b1708d246af5550b23a561234b4a1b5a1011` |
+| month layout | `15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c` |
+| month sealed-epoch full result | `c72c2960789cbf6000c42624dacaab03d70939a239747149dc3825d901c977c4` |
 
 ## Exact ranges and retained results
 
@@ -45,9 +52,52 @@ approximate cardinalities, not retained exact keys or semantically complete forw
 state. Summary SHA-256:
 `e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a`.
 
-The corrected generator retains the measured 1,000-block local pools (20,614 accounts,
-244,196 storage keys) and slides them deterministically so the 100-epoch unions equal
-the HLL estimates.
+## Month cardinality, physical size, and layout evidence
+
+A second read-only `StaticFileProvider` pass covered finalized Base blocks
+**50,229,111..51,525,110** (1,296,000 blocks, approximately 30 days at a two-second
+block time). It streamed **277,758,377 account rows** and **1,154,636,022 storage
+rows**. HyperLogLog estimated **7,956,411 unique accounts** and **218,828,772 unique
+`(address, slot)` keys**. These are approximate cardinalities, not retained exact key
+sets. HLL summary SHA-256:
+`42c965456b49243378b4c106c99ee6be50a40611adff5bf8232e1ab3bf5b511e`.
+
+Reth changeset data plus offsets occupied **93,831,464,168 bytes**:
+**11,759,303,278 account bytes** and **82,072,160,890 storage bytes**. Physical-size
+summary SHA-256:
+`800390687bcea3ebc1b24dc50589b1708d246af5550b23a561234b4a1b5a1011`.
+
+Layout-only processing of all 1,296 real 1,000-block chunks took **814.453 seconds**
+summed across five resumable slices. Block-major Zstd-9 used **24,476,613,098 bytes**;
+key-major Zstd-9 used **20,030,070,751 bytes**, or **15,455.30 bytes/block** and
+**18.1665% less** than block-major. Layout summary SHA-256:
+`15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c`.
+This is real changeset **layout-only** evidence, not an end-to-end Fossil publication,
+checkpoint/catalog, serving, or production object-store result.
+
+The synthetic generator retains the measured 1,000-block local pools (20,614 accounts,
+244,196 storage keys). Its deterministic sliding offsets interpolate first from epoch
+0 to epoch 99 so the 100-epoch unions equal 940,971/17,339,777, then from epoch 99 to
+epoch 1,295 so the month unions equal 7,956,411/218,828,772. Consecutive epoch pools
+overlap and generated IDs remain inside the month universes.
+
+## Completed sealed-epoch month result
+
+The deterministic Base-cardinality-shaped stress test completed **1,296,000 blocks**
+and all **1,296 1,000-block epochs** in **9,449.0865 seconds (2h37m29s)** on the
+documented devbox. It produced 20 completed windows plus 16 active epochs,
+**234,368 immutable objects**, and **23,277,861,710 logical immutable bytes**. The
+object counts include 41,472 data, 165,888 index, 23,060 checkpoint, 1,316 directory,
+40 catalog, and 1,296 commit objects. The compact checked result is
+[`../benchmarks/results/base-shaped-month.json`](../benchmarks/results/base-shaped-month.json);
+the full progress result has SHA-256
+`c72c2960789cbf6000c42624dacaab03d70939a239747149dc3825d901c977c4`.
+
+This result is a completed filesystem-backed sealed-epoch physical-layout stress test,
+not a Fossil archive built from authoritative forward Base state and not production R2
+performance. It uses measured change counts and approximate HLL cardinalities, but it
+excludes semantically complete forward state, code traffic, a production exhaustive
+anchor, provider latency/retries, and provider billing.
 
 ## Corrected sealed-epoch 100k result
 
@@ -55,11 +105,14 @@ The corrected Base-cardinality-shaped generator completed all 100 sealed epochs 
 **228.7859 seconds**, producing **17,456 immutable objects** and **1,141,404,991
 logical immutable bytes**. It passed the prototype gates of 600 seconds, 35,000
 objects, and 2.75 GB. The compact checked result is
-`benchmarks/results/v2-base-shaped-epoch-100k.json`; the complete progress result has
+`benchmarks/results/base-shaped-epoch-100k.json`; the complete progress result has
 SHA-256 `a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4`.
 
 This run used the filesystem backend on the devbox and the approximate HLL cardinality
 shape. It is not production R2 evidence or semantically complete forward EVM state.
+It predates the month-universe storage-address mapping introduced with the piecewise
+pool formula, so it remains historical measured evidence rather than a claimed result
+from the current generator without a new 100k run.
 
 ## Rejected high-cardinality tuned run
 
@@ -83,14 +136,15 @@ one closing checkpoint. Those superseded runs remain rejected tuning evidence.
 The exact 100,000-block run using the former immutable state-key COW prototype emitted
 929,134 files (about 3 GB logical/5 GB allocated) before exhausting the 1,048,576
 `/tmp` inode limit. A rerun on md0 accumulated 26 GB and was unfinished after 15
-minutes. This is negative design evidence explaining the sealed-epoch pivot, not a
-current-v2 result.
+minutes. This is negative design evidence for choosing sealed epochs, not a result for the
+implemented format.
 
 ## Caveats
 
 Reth state changesets are before/unwind values, not a semantically complete forward
-state stream. These measurements establish changeset shape and physical-layout codec
-evidence only. They do not include a Fossil anchor, final post-state reconstruction,
-bytecode completeness, incarnation semantics, sealed-epoch publication, RPC serving,
-or production object-store behavior. The checked epoch benchmark is synthetic and
-lists retained real measurements separately. No giant raw fixture is checked in.
+state stream. The real-range measurements establish changeset shape and layout-codec
+evidence only; they do not provide a Fossil anchor, final post-state reconstruction,
+bytecode completeness, or incarnation semantics. The completed month sealed-epoch
+benchmark is synthetic filesystem evidence shaped by those measurements, not a
+publication of that real Base range, RPC-serving evidence, or production object-store
+behavior. No giant raw fixture is checked in.

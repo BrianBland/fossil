@@ -1,6 +1,6 @@
 # Historical `eth_call` design (explicitly deferred)
 
-Historical EVM execution is not implemented. Work must not begin until v2 exact state
+Historical EVM execution is not implemented. Work must not begin until exact state
 reads, block selection, and the complete block/chain execution context have been
 validated against an independent client.
 
@@ -12,8 +12,8 @@ worse than returning method-not-found.
 
 Execution produces dynamic, sequential state misses. A contract can discover another
 address or slot from prior bytecode/data, so the full read set cannot generally be
-prefetched. A future executor should issue verified v2 exact/predecessor reads through
-a request-local cache, backed by a bounded shared state-object/code cache. It can speculatively
+prefetched. A future executor should issue verified exact/predecessor reads through a
+request-local cache, backed by a bounded shared state-object/code cache. It can speculatively
 prefetch only evidence-based neighbors and must preserve deterministic error and gas
 semantics. Edge caches may retain immutable epoch objects by digest; no cache is authoritative.
 

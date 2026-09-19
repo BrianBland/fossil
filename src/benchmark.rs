@@ -1,10 +1,9 @@
-use crate::archive::PublicationGate;
+use crate::archive::{self, Publication, PublicationGate};
 use crate::format::{
     AccountEvent, Address, BlockMeta, Hash32, Segment, StorageEvent, SEGMENT_SCHEMA,
 };
 use crate::normalized::{Mode, Package};
 use crate::store::{open_store, ArchiveStore, MemoryArchiveStore, VersionedBytes};
-use crate::v2::{self, Publication};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -21,11 +20,14 @@ const SEED: u64 = 0xba5e_f055_2026_0003;
 const ACCOUNTS_PER_BLOCK: u64 = 162;
 const STORAGE_PER_BLOCK: u64 = 851;
 const EPOCH_BLOCKS: u64 = 1_000;
-const MEASURED_EPOCHS: u64 = 100;
+const HUNDRED_K_EPOCHS: u64 = 100;
+const MONTH_EPOCHS: u64 = 1_296;
 const LOCAL_ACCOUNT_POOL: u64 = 20_614;
-const GLOBAL_ACCOUNT_POOL: u64 = 940_971;
+const HUNDRED_K_ACCOUNT_POOL: u64 = 940_971;
+const MONTH_ACCOUNT_POOL: u64 = 7_956_411;
 const LOCAL_STORAGE_POOL: u64 = 244_196;
-const GLOBAL_STORAGE_POOL: u64 = 17_339_777;
+const HUNDRED_K_STORAGE_POOL: u64 = 17_339_777;
+const MONTH_STORAGE_POOL: u64 = 218_828_772;
 const MANUAL_MIN_FREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Default)]
@@ -124,28 +126,28 @@ impl ArchiveStore for CountingStore {
             unique.snapshot.unique_objects += 1;
             unique.snapshot.unique_bytes += bytes.len() as u64;
             let size = bytes.len() as u64;
-            if bytes.starts_with(b"F2ED") {
+            if bytes.starts_with(b"FSED") {
                 unique.snapshot.data_objects += 1;
                 unique.snapshot.data_bytes += size;
-            } else if bytes.starts_with(b"F2EI") {
+            } else if bytes.starts_with(b"FSEI") {
                 unique.snapshot.index_objects += 1;
                 unique.snapshot.index_bytes += size;
-            } else if bytes.starts_with(b"F2EB") {
+            } else if bytes.starts_with(b"FSEB") {
                 unique.snapshot.block_objects += 1;
                 unique.snapshot.block_bytes += size;
-            } else if bytes.starts_with(b"F2EP")
-                || bytes.starts_with(b"F2EM")
-                || bytes.starts_with(b"F2PS")
+            } else if bytes.starts_with(b"FSEP")
+                || bytes.starts_with(b"FSEM")
+                || bytes.starts_with(b"FSPS")
             {
                 unique.snapshot.checkpoint_objects += 1;
                 unique.snapshot.checkpoint_bytes += size;
-            } else if bytes.starts_with(b"F2ER") {
+            } else if bytes.starts_with(b"FSER") {
                 unique.snapshot.directory_objects += 1;
                 unique.snapshot.directory_bytes += size;
-            } else if bytes.starts_with(b"F2EC") {
+            } else if bytes.starts_with(b"FSEC") {
                 unique.snapshot.commit_objects += 1;
                 unique.snapshot.commit_bytes += size;
-            } else if bytes.starts_with(b"F2EW") || bytes.starts_with(b"F2WC") {
+            } else if bytes.starts_with(b"FSEW") || bytes.starts_with(b"FSWC") {
                 unique.snapshot.catalog_objects += 1;
                 unique.snapshot.catalog_bytes += size;
             }
@@ -210,7 +212,7 @@ async fn run_checked(output: Option<&Path>) -> Result<Value> {
     let store = Arc::new(CountingStore::memory());
     let archive: Arc<dyn ArchiveStore> = store.clone();
     let before_publish = store.snapshot();
-    v2::publish(
+    archive::publish(
         archive.clone(),
         package,
         PublicationGate::Finalized {
@@ -254,9 +256,9 @@ async fn run_checked(output: Option<&Path>) -> Result<Value> {
 
     let rollover = rollover_measurement().await?;
     let result = json!({
-        "schema": "fossil-v2-sealed-epoch-benchmark/1",
+        "schema": "fossil-sealed-epoch-benchmark/1",
         "claim": "checked synthetic Base-shaped sealed-epoch physical-layout evidence; not semantically complete forward state or production object-store performance",
-        "reproduction_command": "cargo run --release -- benchmark --output benchmarks/results/v2-base-shaped-epoch.json",
+        "reproduction_command": "cargo run --release -- benchmark --output benchmarks/results/base-shaped-epoch.json",
         "measurement_provenance": provenance(),
         "workload": {
             "blocks": EPOCH_BLOCKS,
@@ -268,8 +270,10 @@ async fn run_checked(output: Option<&Path>) -> Result<Value> {
             "target_local_storage_key_pool": LOCAL_STORAGE_POOL,
             "generated_unique_accounts": oracle.len(),
             "generated_unique_storage_keys": generated_storage_keys.len(),
-            "expected_100k_global_account_pool": expected_union_pool(LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL, MEASURED_EPOCHS),
-            "expected_100k_global_storage_key_pool": expected_union_pool(LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL, MEASURED_EPOCHS),
+            "expected_100k_global_account_pool": expected_union_pool(LOCAL_ACCOUNT_POOL, HUNDRED_K_ACCOUNT_POOL, MONTH_ACCOUNT_POOL, HUNDRED_K_EPOCHS),
+            "expected_100k_global_storage_key_pool": expected_union_pool(LOCAL_STORAGE_POOL, HUNDRED_K_STORAGE_POOL, MONTH_STORAGE_POOL, HUNDRED_K_EPOCHS),
+            "expected_month_global_account_pool": expected_union_pool(LOCAL_ACCOUNT_POOL, HUNDRED_K_ACCOUNT_POOL, MONTH_ACCOUNT_POOL, MONTH_EPOCHS),
+            "expected_month_global_storage_key_pool": expected_union_pool(LOCAL_STORAGE_POOL, HUNDRED_K_STORAGE_POOL, MONTH_STORAGE_POOL, MONTH_EPOCHS),
             "seed": format!("0x{SEED:016x}")
         },
         "publication": {
@@ -297,7 +301,7 @@ async fn run_checked(output: Option<&Path>) -> Result<Value> {
         },
         "correctness": {
             "predecessor_oracle": predecessor_ok,
-            "forced_fingerprint_collision_full_key_verified": v2::benchmark_forced_collision_check()?,
+            "forced_fingerprint_collision_full_key_verified": archive::benchmark_forced_collision_check()?,
             "returned_logical_bytes": returned_bytes
         },
         "startup": {
@@ -335,7 +339,7 @@ async fn rollover_measurement() -> Result<Value> {
     for block in 0..=64_u64 {
         let package = lightweight_package(block);
         let before = store.snapshot();
-        let outcome = v2::publish(
+        let outcome = archive::publish(
             archive.clone(),
             package,
             PublicationGate::Finalized {
@@ -478,7 +482,7 @@ async fn run_manual(
         let package = shaped_package(start, count, blocks, preceding, start == 0)?;
         let hash = package.segment.blocks.last().unwrap().hash;
         let before = store.snapshot();
-        v2::publish(
+        archive::publish(
             archive.clone(),
             package,
             PublicationGate::Finalized {
@@ -548,7 +552,7 @@ fn manual_result(
     complete: bool,
 ) -> Value {
     json!({
-        "schema": "fossil-v2-manual-sealed-epochs/1",
+        "schema": "fossil-manual-sealed-epochs/1",
         "complete": complete,
         "blocks_requested": blocks,
         "chunk_blocks": chunk_blocks,
@@ -572,8 +576,10 @@ fn manual_result(
         "corrected_generator_pools": {
             "local_accounts_per_1000_blocks": LOCAL_ACCOUNT_POOL,
             "local_storage_keys_per_1000_blocks": LOCAL_STORAGE_POOL,
-            "expected_accounts_across_100_epochs": expected_union_pool(LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL, MEASURED_EPOCHS),
-            "expected_storage_keys_across_100_epochs": expected_union_pool(LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL, MEASURED_EPOCHS)
+            "expected_accounts_across_100_epochs": expected_union_pool(LOCAL_ACCOUNT_POOL, HUNDRED_K_ACCOUNT_POOL, MONTH_ACCOUNT_POOL, HUNDRED_K_EPOCHS),
+            "expected_storage_keys_across_100_epochs": expected_union_pool(LOCAL_STORAGE_POOL, HUNDRED_K_STORAGE_POOL, MONTH_STORAGE_POOL, HUNDRED_K_EPOCHS),
+            "expected_accounts_across_1296_epochs": expected_union_pool(LOCAL_ACCOUNT_POOL, HUNDRED_K_ACCOUNT_POOL, MONTH_ACCOUNT_POOL, MONTH_EPOCHS),
+            "expected_storage_keys_across_1296_epochs": expected_union_pool(LOCAL_STORAGE_POOL, HUNDRED_K_STORAGE_POOL, MONTH_STORAGE_POOL, MONTH_EPOCHS)
         },
         "tuned_format_fanout": {
             "router_partitions": 128,
@@ -600,8 +606,18 @@ fn shaped_package(
     anchor: bool,
 ) -> Result<Package> {
     let epoch_index = start / EPOCH_BLOCKS;
-    let account_offset = sliding_pool_offset(epoch_index, LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL);
-    let storage_offset = sliding_pool_offset(epoch_index, LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL);
+    let account_offset = sliding_pool_offset(
+        epoch_index,
+        LOCAL_ACCOUNT_POOL,
+        HUNDRED_K_ACCOUNT_POOL,
+        MONTH_ACCOUNT_POOL,
+    );
+    let storage_offset = sliding_pool_offset(
+        epoch_index,
+        LOCAL_STORAGE_POOL,
+        HUNDRED_K_STORAGE_POOL,
+        MONTH_STORAGE_POOL,
+    );
     let empty_code = Hash32(Keccak256::digest([]).into());
     let mut blocks = Vec::with_capacity(count as usize);
     let mut accounts = Vec::with_capacity((count * ACCOUNTS_PER_BLOCK) as usize);
@@ -674,23 +690,32 @@ fn shaped_package(
     })
 }
 
-fn sliding_pool_offset(epoch: u64, local_pool: u64, global_pool: u64) -> u64 {
-    if global_pool <= local_pool || epoch == 0 {
+fn sliding_pool_offset(epoch: u64, local_pool: u64, hundred_k_pool: u64, month_pool: u64) -> u64 {
+    if epoch == 0 {
         return 0;
     }
-    epoch.saturating_mul(global_pool - local_pool) / (MEASURED_EPOCHS - 1)
+    // The pool union after epoch N is local_pool + offset(N). Interpolate the
+    // measured union endpoints at epochs 0, 99, and 1,295, then hold the month cap.
+    let hundred_k_last = HUNDRED_K_EPOCHS - 1;
+    if epoch <= hundred_k_last {
+        return epoch * (hundred_k_pool - local_pool) / hundred_k_last;
+    }
+    let month_last = MONTH_EPOCHS - 1;
+    let tail_epoch = epoch.min(month_last) - hundred_k_last;
+    (hundred_k_pool - local_pool)
+        + tail_epoch * (month_pool - hundred_k_pool) / (month_last - hundred_k_last)
 }
 
-fn expected_union_pool(local_pool: u64, global_pool: u64, epochs: u64) -> u64 {
+fn expected_union_pool(local_pool: u64, hundred_k_pool: u64, month_pool: u64, epochs: u64) -> u64 {
     if epochs == 0 {
         0
     } else {
-        local_pool + sliding_pool_offset(epochs - 1, local_pool, global_pool)
+        local_pool + sliding_pool_offset(epochs - 1, local_pool, hundred_k_pool, month_pool)
     }
 }
 
 fn storage_address_id(storage_key_id: u64) -> u64 {
-    storage_key_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) % GLOBAL_ACCOUNT_POOL
+    storage_key_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) % MONTH_ACCOUNT_POOL
 }
 
 fn account_oracle(package: &Package) -> BTreeMap<Address, Vec<AccountEvent>> {
@@ -739,7 +764,8 @@ fn block_hash(block: u64) -> Hash32 {
 fn provenance() -> Value {
     json!({
         "sampled_at": "2026-09-19",
-        "finalized_head": 51498020,
+        "hundred_k_finalized_head": 51498020,
+        "month_finalized_head": 51525110,
         "hardware": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
         "node_image": "ghcr.io/base/node:v1.3.0-rc.6",
         "base_reth_tag": "base-v2.5.2.6",
@@ -759,6 +785,36 @@ fn provenance() -> Value {
             "key_major_zstd_9_bytes": 1504915953,
             "elapsed_seconds": 67.26,
             "summary_sha256": "d35bc9aaf183537f332a6687089f349060d21d9650193e719c196b7438b7f01b"
+        },
+        "real_month_hll_cardinality": {
+            "range": "50,229,111..51,525,110",
+            "blocks": 1296000,
+            "account_rows": 277758377,
+            "storage_rows": 1154636022_u64,
+            "estimated_unique_accounts": 7956411,
+            "estimated_unique_address_slot_keys": 218828772,
+            "method": "read-only StaticFileProvider streaming HyperLogLog estimate",
+            "caveat": "HLL cardinalities are approximate; they shape synthetic pools but are not exact key lists",
+            "summary_sha256": "42c965456b49243378b4c106c99ee6be50a40611adff5bf8232e1ab3bf5b511e"
+        },
+        "real_month_reth_changesets": {
+            "range": "50,229,111..51,525,110",
+            "account_data_and_offsets_bytes": 11759303278_u64,
+            "storage_data_and_offsets_bytes": 82072160890_u64,
+            "total_data_and_offsets_bytes": 93831464168_u64,
+            "summary_sha256": "800390687bcea3ebc1b24dc50589b1708d246af5550b23a561234b4a1b5a1011"
+        },
+        "real_month_layout_only": {
+            "range": "50,229,111..51,525,110",
+            "chunks": 1296,
+            "resumable_slices": 5,
+            "summed_elapsed_seconds": 814.453,
+            "block_major_zstd_9_bytes": 24476613098_u64,
+            "key_major_zstd_9_bytes": 20030070751_u64,
+            "key_major_bytes_per_block": 15455.30,
+            "key_major_percent_smaller_than_block_major": 18.1665,
+            "summary_sha256": "15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c",
+            "caveat": "layout-only processing of real changesets; not an end-to-end sealed-epoch archive run"
         },
         "rejected_tuned_high_cardinality_generator_run": {
             "elapsed_seconds": 425.3685,
@@ -840,35 +896,46 @@ mod tests {
     async fn small_epoch_benchmark_has_two_get_startup_and_ingested_repeat() {
         let package = shaped_package(0, 10, 10, None, true).unwrap();
         assert_eq!(package.segment.blocks.len(), 10);
-        assert!(v2::benchmark_forced_collision_check().unwrap());
+        assert!(archive::benchmark_forced_collision_check().unwrap());
     }
 
     #[test]
-    fn sliding_pool_formulas_match_local_and_100k_hll_cardinality() {
-        assert_eq!(
-            expected_union_pool(LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL, 1),
-            LOCAL_ACCOUNT_POOL
-        );
-        assert_eq!(
-            expected_union_pool(LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL, 1),
-            LOCAL_STORAGE_POOL
-        );
-        assert_eq!(
-            expected_union_pool(LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL, MEASURED_EPOCHS),
-            GLOBAL_ACCOUNT_POOL
-        );
-        assert_eq!(
-            expected_union_pool(LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL, MEASURED_EPOCHS),
-            GLOBAL_STORAGE_POOL
-        );
-        for epoch in 1..MEASURED_EPOCHS {
-            let account_shift = sliding_pool_offset(epoch, LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL)
-                - sliding_pool_offset(epoch - 1, LOCAL_ACCOUNT_POOL, GLOBAL_ACCOUNT_POOL);
-            let storage_shift = sliding_pool_offset(epoch, LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL)
-                - sliding_pool_offset(epoch - 1, LOCAL_STORAGE_POOL, GLOBAL_STORAGE_POOL);
-            assert!(account_shift < LOCAL_ACCOUNT_POOL);
-            assert!(storage_shift < LOCAL_STORAGE_POOL);
+    fn sliding_pool_formulas_hit_both_measurements_with_consecutive_overlap() {
+        for (local, hundred_k, month) in [
+            (
+                LOCAL_ACCOUNT_POOL,
+                HUNDRED_K_ACCOUNT_POOL,
+                MONTH_ACCOUNT_POOL,
+            ),
+            (
+                LOCAL_STORAGE_POOL,
+                HUNDRED_K_STORAGE_POOL,
+                MONTH_STORAGE_POOL,
+            ),
+        ] {
+            assert_eq!(expected_union_pool(local, hundred_k, month, 1), local);
+            assert_eq!(
+                expected_union_pool(local, hundred_k, month, HUNDRED_K_EPOCHS),
+                hundred_k
+            );
+            assert_eq!(
+                expected_union_pool(local, hundred_k, month, MONTH_EPOCHS),
+                month
+            );
+            for epoch in 0..MONTH_EPOCHS {
+                let offset = sliding_pool_offset(epoch, local, hundred_k, month);
+                assert!(offset + local <= month, "epoch {epoch} exceeds ID universe");
+                if epoch > 0 {
+                    let previous = sliding_pool_offset(epoch - 1, local, hundred_k, month);
+                    assert!(offset >= previous, "epoch {epoch} moves backwards");
+                    assert!(
+                        offset - previous < local,
+                        "epoch {epoch} loses consecutive-pool overlap"
+                    );
+                }
+            }
         }
+        assert_eq!(MONTH_EPOCHS / 64, 20);
     }
 
     #[tokio::test]
