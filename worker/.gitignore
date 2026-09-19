@@ -1,4 +1,4 @@
 /build/
 /node_modules/
 /target/
-/.wrangler-dry-run/
+/.wrangler*-dry-run/
