@@ -1,0 +1,4 @@
+/target/
+/fossil-cache/
+*.tmp
+.DS_Store
