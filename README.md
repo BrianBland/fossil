@@ -12,7 +12,7 @@ format and one CLI path.
 
 Start with the illustrated [architecture and storage walkthrough](docs/architecture.md).
 Try the public, read-only [live Base R2/Cloudflare Worker demo](docs/live-demo.md).
-Runtime choices for the native server and the Rust/WASM Cloudflare active-window
+Runtime choices for the native server and the bounded Rust/WASM Cloudflare archive
 reader are described in [deployment](docs/deployment.md). Worker setup and scope are
 in [`worker/README.md`](worker/README.md). See also [format](docs/format.md),
 [content integrity](docs/integrity.md), [semantics](docs/semantics.md),
@@ -71,6 +71,18 @@ block N means post-execution state after N. Missing/deleted accounts and absent
 storage return Ethereum zero values.
 
 ## Benchmarks
+
+The live Rust/WASM Worker demo now exposes an exact sparse overlay across Base blocks
+`51,232,601..51,535,000` (302,400 blocks/303 epochs). The 81,245,782-byte query
+archive built in 294.920 seconds and uploaded to R2 in 71 seconds. A separate
+4,427,761,942-byte real-week physical-layout corpus is retained as layout evidence,
+not queryable forward state. After both uploads, the bucket remained below its 5 GB
+cap at 4,514,343,105 bytes. Results, environment-specific query medians, and scope
+caveats are in
+[`benchmarks/results/live-week-demo.json`](benchmarks/results/live-week-demo.json)
+and the [copy-paste live guide](docs/live-demo.md). This sparse overlay is exact only
+for its documented vault, WETH-contract native ETH balance, and pool reserve keys; it
+is not arbitrary-address-complete.
 
 The checked 1,000-block artifact is
 [`benchmarks/results/base-shaped-epoch.json`](benchmarks/results/base-shaped-epoch.json):
@@ -133,10 +145,12 @@ and code are durable. Publication never deletes. Offline inventory and garbage
 collection are future work.
 
 The native Tokio/Axum binary is the full JSON-RPC server. The Rust/WASM Cloudflare
-Worker is a bounded, active-window-only reader and read-only object gateway, not a
+Worker is a bounded catalog/checkpoint reader and read-only object gateway, not a
 second archive. A sparse public [live demo](docs/live-demo.md) serves standard balance,
 nonce, code, storage, chain ID, block-number, and client-version methods directly from
-R2. Logs and historical EVM execution are not implemented.
+R2. Its week overlay is exact for the explicitly tracked keys, including the native ETH
+balance held by the WETH contract, but is not arbitrary-address-complete. Logs and
+historical EVM execution are not implemented.
 
 Input remains canonical `fossil-export/1`. The exporter/finality source is trusted.
 Fossil validates continuity, references, bounds, and content integrity, but SHA-256

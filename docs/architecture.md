@@ -13,7 +13,7 @@ flowchart LR
     O --> R1[Native Tokio/Axum reader]
     O --> R2[Native regional reader]
     O --> RN[Many cheap/pruned readers]
-    O -->|implemented R2 binding| W[Cloudflare Rust/WASM active-window reader]
+    O -->|implemented R2 binding| W[Cloudflare bounded Rust/WASM archive reader]
     EC[Edge RPC and object clients] --> W
     C[RPC clients] --> R1
     C --> R2
@@ -27,16 +27,15 @@ hot/pruned node -> exporter/sealer -> one R2/S3-compatible object store
                                       |       |        |
                                       v       v        v
                                   native   native   Rust/WASM Worker
-                                  reader   reader   (active-window decoder)
+                                  reader   reader   (catalog/checkpoint decoder)
 ```
 
 There is no DHT, peer routing, or federation. Scale comes from many stateless readers
 sharing one backend and bounded caches. The Rust/WASM Worker reads the standard
 publication head and immutable objects below `fossil-demo/`, serves the bounded
-balance/nonce/code/storage JSON-RPC subset for the active window, and retains a
-read-only gateway restricted to canonical immutable SHA-256 CAS keys. Completed-window
-and checkpoint fallback remain native-only;
-log serving is not implemented. See [deployment](deployment.md) for runtime details.
+balance/nonce/code/storage JSON-RPC subset across active and completed windows (including
+catalog selection and checkpoint fallback), and retains a read-only gateway restricted
+to canonical immutable SHA-256 CAS keys. Log serving is not implemented. See [deployment](deployment.md) for runtime details.
 
 ## Publication object hierarchy
 

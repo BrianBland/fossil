@@ -3,13 +3,19 @@ use fossil_worker::core::*;
 use futures::executor::block_on;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Cursor;
 
-struct MemoryStore(HashMap<String, Vec<u8>>);
+struct MemoryStore {
+    objects: HashMap<String, Vec<u8>>,
+    gets: Cell<usize>,
+}
 impl ObjectStore for MemoryStore {
     async fn get(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        self.gets.set(self.gets.get() + 1);
         let bytes = self
-            .0
+            .objects
             .get(key)
             .cloned()
             .ok_or_else(|| ArchiveError::Unavailable("missing".into()))?;
@@ -36,51 +42,332 @@ fn fixture() -> (MemoryStore, Value) {
             )
         })
         .collect();
-    (MemoryStore(objects), value)
+    (
+        MemoryStore {
+            objects,
+            gets: Cell::new(0),
+        },
+        value,
+    )
 }
 
-fn checkpoint_fixture() -> MemoryStore {
-    let (mut store, _) = fixture();
-    let head_key = "fossil-demo/chains/0x2105/heads/finalized.bin";
-    let mut head = store.0[head_key].clone();
-    let commit_digest = hex::encode(&head[61..93]);
-    let commit_key = format!(
-        "fossil-demo/objects/sha256/{}/{commit_digest}",
-        &commit_digest[..2]
-    );
-    let mut commit = store.0.remove(&commit_key).unwrap();
-    let directory_digest = hex::encode(&commit[242..274]);
-    let directory_key = format!(
-        "fossil-demo/objects/sha256/{}/{directory_digest}",
-        &directory_digest[..2]
-    );
-    let mut directory = store.0.remove(&directory_key).unwrap();
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TestRef {
+    digest: [u8; 32],
+    length: u32,
+}
+type TestPointer = (TestRef, u32, u32);
+type TestEpoch = (
+    [TestRef; 32],
+    [TestRef; 128],
+    BTreeMap<Vec<u8>, TestPointer>,
+);
+type PartitionEntries = BTreeMap<(usize, usize), Vec<(Vec<u8>, TestPointer)>>;
 
-    directory[13..45].fill(0xbb);
-    directory[45..49].copy_from_slice(&1u32.to_be_bytes());
-    let new_directory_digest = Sha256::digest(&directory);
-    commit[242..274].copy_from_slice(&new_directory_digest);
-    let new_commit_digest = Sha256::digest(&commit);
-    head[61..93].copy_from_slice(&new_commit_digest);
+fn uleb(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+    uleb(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+fn object_ref(out: &mut Vec<u8>, value: TestRef) {
+    out.extend_from_slice(&value.digest);
+    out.extend_from_slice(&value.length.to_be_bytes());
+}
+fn add_object(objects: &mut HashMap<String, Vec<u8>>, value: Vec<u8>) -> TestRef {
+    let digest: [u8; 32] = Sha256::digest(&value).into();
+    let text = hex::encode(digest);
+    objects.insert(
+        format!("fossil-demo/objects/sha256/{}/{text}", &text[..2]),
+        value.clone(),
+    );
+    TestRef {
+        digest,
+        length: value.len() as u32,
+    }
+}
+fn compressed(magic: &[u8; 4], decoded: &[u8]) -> Vec<u8> {
+    let encoded = zstd::encode_all(Cursor::new(decoded), 9).unwrap();
+    let mut out = magic.to_vec();
+    out.push(1);
+    out.extend_from_slice(&(decoded.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    out.extend_from_slice(&encoded);
+    out
+}
+fn state_key(namespace: u8, address: [u8; 20], incarnation: Option<u64>) -> Vec<u8> {
+    let mut key = vec![namespace];
+    key.extend_from_slice(&address);
+    if let Some(incarnation) = incarnation {
+        key.extend_from_slice(&incarnation.to_be_bytes());
+        key.extend_from_slice(&[0; 31]);
+        key.push(1);
+    }
+    key
+}
+fn route(key: &[u8]) -> (usize, usize, [u8; 12]) {
+    let full = Sha256::digest(key);
+    let routed = Sha256::digest(&key[1..21]);
+    (
+        routed[0] as usize >> 1,
+        full[12] as usize >> 5,
+        full[..12].try_into().unwrap(),
+    )
+}
+fn account(exists: bool, incarnation: u64, balance: u8) -> Vec<u8> {
+    let mut out = vec![u8::from(exists)];
+    uleb(&mut out, incarnation);
+    uleb(&mut out, 1);
+    out.push(u8::from(balance != 0));
+    if balance != 0 {
+        out.push(balance);
+    }
+    out.extend_from_slice(
+        &hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470").unwrap(),
+    );
+    out
+}
+fn storage(value: u8) -> Vec<u8> {
+    vec![1, value]
+}
 
-    let directory_hex = hex::encode(new_directory_digest);
-    let commit_hex = hex::encode(new_commit_digest);
-    store.0.insert(
-        format!(
-            "fossil-demo/objects/sha256/{}/{directory_hex}",
-            &directory_hex[..2]
-        ),
-        directory,
+fn build_epoch(
+    objects: &mut HashMap<String, Vec<u8>>,
+    block: u64,
+    changes: BTreeMap<Vec<u8>, Vec<u8>>,
+) -> TestEpoch {
+    let mut groups: BTreeMap<usize, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
+    for (key, value) in changes {
+        groups
+            .entry(route(&key).0 >> 2)
+            .or_default()
+            .insert(key, value);
+    }
+    let mut data = [TestRef::default(); 32];
+    let mut pointers = BTreeMap::new();
+    let mut by_partition: BTreeMap<usize, Vec<([u8; 12], u32, TestRef)>> = BTreeMap::new();
+    for (group, runs) in groups {
+        let mut body = Vec::new();
+        uleb(&mut body, runs.len() as u64);
+        for (run_index, (key, value)) in runs.iter().enumerate() {
+            bytes(&mut body, key);
+            uleb(&mut body, 1);
+            uleb(&mut body, block);
+            bytes(&mut body, value);
+            by_partition.entry(route(key).0).or_default().push((
+                route(key).2,
+                run_index as u32,
+                TestRef::default(),
+            ));
+        }
+        let reference = add_object(objects, compressed(b"FSED", &body));
+        data[group] = reference;
+        for (run_index, key) in runs.keys().enumerate() {
+            pointers.insert(key.clone(), (reference, run_index as u32, 0));
+            let entries = by_partition.get_mut(&route(key).0).unwrap();
+            entries
+                .iter_mut()
+                .filter(|entry| entry.1 == run_index as u32)
+                .for_each(|entry| entry.2 = reference);
+        }
+    }
+    let mut indexes = [TestRef::default(); 128];
+    for (partition, mut entries) in by_partition {
+        entries.sort_by_key(|entry| (entry.0, entry.1));
+        let data_ref = entries[0].2;
+        let mut index = b"FSEI".to_vec();
+        index.push(1);
+        index.push(partition as u8);
+        index.extend_from_slice(&block.to_be_bytes());
+        uleb(&mut index, 1);
+        object_ref(&mut index, data_ref);
+        uleb(&mut index, entries.len() as u64);
+        for (fingerprint, run_index, _) in entries {
+            index.extend_from_slice(&fingerprint);
+            uleb(&mut index, 0);
+            index.push(0);
+            index.extend_from_slice(&run_index.to_be_bytes());
+        }
+        indexes[partition] = add_object(objects, index);
+    }
+    (data, indexes, pointers)
+}
+
+fn directory(
+    window_start: u64,
+    checkpoint: TestRef,
+    epochs: &[(u64, [TestRef; 32], [TestRef; 128])],
+    dummy: TestRef,
+) -> Vec<u8> {
+    let mut out = b"FSER".to_vec();
+    out.push(1);
+    out.extend_from_slice(&window_start.to_be_bytes());
+    object_ref(&mut out, checkpoint);
+    out.push(epochs.len() as u8);
+    for (block, data, indexes) in epochs {
+        out.extend_from_slice(&block.to_be_bytes());
+        out.extend_from_slice(&block.to_be_bytes());
+        object_ref(&mut out, dummy);
+        for reference in data {
+            object_ref(&mut out, *reference);
+        }
+        for reference in indexes {
+            object_ref(&mut out, *reference);
+        }
+    }
+    out
+}
+
+fn completed_window_fixture(
+    corrupt_catalog_range: bool,
+    corrupt_checkpoint_boundary: bool,
+) -> (MemoryStore, [u8; 32]) {
+    let mut objects = HashMap::new();
+    let a = [0x11; 20];
+    let b = [0x22; 20];
+    let c = [0x33; 20];
+    let mut old = BTreeMap::new();
+    for (address, balance) in [(a, 1), (b, 2), (c, 3)] {
+        old.insert(state_key(1, address, None), account(true, 1, balance));
+        old.insert(state_key(2, address, Some(1)), storage(balance + 40));
+    }
+    let (old_data, old_indexes, pointers) = build_epoch(&mut objects, 0, old);
+    let dummy = old_data
+        .iter()
+        .copied()
+        .find(|item| item.length != 0)
+        .unwrap();
+
+    let mut partition_entries = PartitionEntries::new();
+    for (key, pointer) in pointers {
+        let routed = route(&key);
+        partition_entries
+            .entry((routed.0, routed.1))
+            .or_default()
+            .push((key, pointer));
+    }
+    let mut partition_shards: BTreeMap<usize, [TestRef; 8]> = BTreeMap::new();
+    for ((partition, subshard), mut entries) in partition_entries {
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut body = Vec::new();
+        uleb(&mut body, entries.len() as u64);
+        for (key, (object, run, version)) in entries {
+            bytes(&mut body, &key);
+            object_ref(&mut body, object);
+            body.extend_from_slice(&run.to_be_bytes());
+            body.extend_from_slice(&version.to_be_bytes());
+        }
+        let shard = add_object(&mut objects, compressed(b"FSEP", &body));
+        partition_shards.entry(partition).or_default()[subshard] = shard;
+    }
+    let mut partitions = [TestRef::default(); 128];
+    for (partition, shards) in partition_shards {
+        let mut manifest = b"FSPS".to_vec();
+        manifest.push(1);
+        for shard in shards {
+            object_ref(&mut manifest, shard);
+        }
+        partitions[partition] = add_object(&mut objects, manifest);
+    }
+    let mut checkpoint = b"FSEM".to_vec();
+    checkpoint.push(1);
+    checkpoint.extend_from_slice(
+        &(if corrupt_checkpoint_boundary {
+            62u64
+        } else {
+            63
+        })
+        .to_be_bytes(),
     );
-    store.0.insert(
-        format!(
-            "fossil-demo/objects/sha256/{}/{commit_hex}",
-            &commit_hex[..2]
-        ),
-        commit,
+    for partition in partitions {
+        object_ref(&mut checkpoint, partition);
+    }
+    let checkpoint_ref = add_object(&mut objects, checkpoint);
+
+    let empty_data = [TestRef::default(); 32];
+    let empty_indexes = [TestRef::default(); 128];
+    let mut completed_epochs = vec![(0, old_data, old_indexes)];
+    for block in 1..64 {
+        completed_epochs.push((block, empty_data, empty_indexes));
+    }
+    let completed_ref = add_object(
+        &mut objects,
+        directory(0, TestRef::default(), &completed_epochs, dummy),
     );
-    store.0.insert(head_key.into(), head);
-    store
+
+    let mut active = BTreeMap::new();
+    active.insert(state_key(1, a, None), account(false, 1, 0));
+    active.insert(state_key(1, c, None), account(true, 2, 9));
+    active.insert(state_key(2, c, Some(2)), storage(99));
+    let (active_data, active_indexes, _) = build_epoch(&mut objects, 64, active);
+    let active_ref = add_object(
+        &mut objects,
+        directory(
+            64,
+            checkpoint_ref,
+            &[(64, active_data, active_indexes)],
+            dummy,
+        ),
+    );
+
+    let mut chunk = b"FSWC".to_vec();
+    chunk.push(1);
+    uleb(&mut chunk, 1);
+    chunk.extend_from_slice(&0u64.to_be_bytes());
+    chunk.extend_from_slice(&(if corrupt_catalog_range { 62u64 } else { 63 }).to_be_bytes());
+    object_ref(&mut chunk, completed_ref);
+    let chunk_ref = add_object(&mut objects, chunk);
+    let mut root = b"FSEW".to_vec();
+    root.push(1);
+    uleb(&mut root, 1);
+    root.extend_from_slice(&0u64.to_be_bytes());
+    object_ref(&mut root, chunk_ref);
+    let root_ref = add_object(&mut objects, root);
+
+    let mut commit = b"FSEC".to_vec();
+    commit.push(1);
+    commit.extend_from_slice(&1u64.to_be_bytes());
+    commit.extend_from_slice(&8453u64.to_be_bytes());
+    commit.extend_from_slice(&[1; 32]);
+    commit.extend_from_slice(&0u64.to_be_bytes());
+    commit.extend_from_slice(&[2; 32]);
+    commit.extend_from_slice(&[3; 32]);
+    commit.extend_from_slice(&64u64.to_be_bytes());
+    commit.extend_from_slice(&[4; 32]);
+    object_ref(&mut commit, TestRef::default());
+    commit.push(1);
+    commit.extend_from_slice(&[5; 32]);
+    commit.extend_from_slice(&64u64.to_be_bytes());
+    object_ref(&mut commit, active_ref);
+    object_ref(&mut commit, root_ref);
+    assert_eq!(commit.len(), 314);
+    let commit_ref = add_object(&mut objects, commit);
+    let mut head = b"FSEH".to_vec();
+    head.push(1);
+    head.extend_from_slice(&1u64.to_be_bytes());
+    head.extend_from_slice(&8453u64.to_be_bytes());
+    head.extend_from_slice(&64u64.to_be_bytes());
+    head.extend_from_slice(&[3; 32]);
+    object_ref(&mut head, commit_ref);
+    objects.insert("fossil-demo/chains/0x2105/heads/finalized.bin".into(), head);
+    (
+        MemoryStore {
+            objects,
+            gets: Cell::new(0),
+        },
+        commit_ref.digest,
+    )
 }
 
 #[test]
@@ -217,10 +504,10 @@ fn selector_and_corruption_fail_closed() {
         drop(fixture_value);
 
         let (mut store, _) = fixture();
-        let head = &store.0["fossil-demo/chains/0x2105/heads/finalized.bin"];
+        let head = &store.objects["fossil-demo/chains/0x2105/heads/finalized.bin"];
         let digest = hex::encode(&head[61..93]);
         let commit_key = format!("fossil-demo/objects/sha256/{}/{digest}", &digest[..2]);
-        store.0.get_mut(&commit_key).unwrap()[10] ^= 1;
+        store.objects.get_mut(&commit_key).unwrap()[10] ^= 1;
         assert_eq!(
             Reader::load(&store, "fossil-demo/".into(), 8453)
                 .await
@@ -231,7 +518,7 @@ fn selector_and_corruption_fail_closed() {
 
         let (mut malformed, _) = fixture();
         malformed
-            .0
+            .objects
             .get_mut("fossil-demo/chains/0x2105/heads/finalized.bin")
             .unwrap()[93..97]
             .fill(0);
@@ -246,19 +533,67 @@ fn selector_and_corruption_fail_closed() {
 }
 
 #[test]
-fn active_checkpoint_fallback_is_explicitly_unavailable() {
+fn completed_window_catalog_and_checkpoint_golden_cover_65_epochs() {
     block_on(async {
-        let store = checkpoint_fixture();
+        let (store, commit_digest) = completed_window_fixture(false, false);
+        assert_eq!(
+            hex::encode(commit_digest),
+            "5e60880acc06fbfc02d32d530ae08760f8f83edf0ef6c9f45a129e3c27149957"
+        );
+        let a = [0x11; 20];
+        let b = [0x22; 20];
+        let c = [0x33; 20];
+        let slot = {
+            let mut value = [0; 32];
+            value[31] = 1;
+            value
+        };
         let mut reader = Reader::load(&store, "fossil-demo/".into(), 8453)
             .await
             .unwrap();
-        let absent = parse_address(&Value::String(
-            "0x3333333333333333333333333333333333333333".into(),
-        ))
-        .unwrap();
+        assert_eq!(
+            reader
+                .resolve_selector(&Value::String("0x0".into()))
+                .unwrap(),
+            0
+        );
+        let old = reader.account_at(a, 0).await.unwrap().unwrap();
+        assert_eq!(old.balance[31], 1);
+        assert_eq!(reader.storage_at(a, slot, 0).await.unwrap()[31], 41);
+
+        let unchanged = reader.account_at(b, 64).await.unwrap().unwrap();
+        assert_eq!(unchanged.balance[31], 2);
+        assert_eq!(reader.storage_at(b, slot, 64).await.unwrap()[31], 42);
+        assert!(reader.account_at(a, 64).await.unwrap().is_none());
+        assert_eq!(reader.storage_at(a, slot, 64).await.unwrap(), [0; 32]);
+        assert_eq!(reader.storage_at(c, slot, 64).await.unwrap()[31], 99);
+        assert!(reader.account_at([0x44; 20], 64).await.unwrap().is_none());
+
+        // A cold storage query includes head+commit, active directory, account
+        // checkpoint fallback, and incarnation-qualified storage fallback.
+        store.gets.set(0);
+        let mut cold = Reader::load(&store, "fossil-demo/".into(), 8453)
+            .await
+            .unwrap();
+        assert_eq!(cold.storage_at(b, slot, 64).await.unwrap()[31], 42);
+        assert_eq!(store.gets.get(), 8);
+
+        let (corrupt, _) = completed_window_fixture(true, false);
+        let mut reader = Reader::load(&corrupt, "fossil-demo/".into(), 8453)
+            .await
+            .unwrap();
         assert!(matches!(
-            reader.account_at(absent, 102).await,
-            Err(ArchiveError::Unavailable(message)) if message.contains("checkpoint fallback")
+            reader.account_at(a, 0).await,
+            Err(ArchiveError::Integrity)
+        ));
+
+        let (corrupt, _) = completed_window_fixture(false, true);
+        let mut reader = Reader::load(&corrupt, "fossil-demo/".into(), 8453)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.account_at(b, 64).await,
+            Err(ArchiveError::Integrity)
         ));
     });
 }

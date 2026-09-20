@@ -34,7 +34,7 @@ Native regional servers are the preferred tier for miss-heavy historical `eth_ca
 tracing, large working sets, or deployments that benefit from a local SSD cache.
 Historical EVM execution and tracing are not implemented today.
 
-## Cloudflare Worker: Rust/WASM active-window reader
+## Cloudflare Worker: bounded Rust/WASM archive reader
 
 [`worker/`](../worker/README.md) is a worker-rs crate compiled to WASM. Its direct R2
 binding loads the normal mutable publication head and immutable format-v1 objects; the
@@ -47,20 +47,22 @@ ID, and block-number reads, plus the standard client version method. It also ret
 a read-only streaming gateway restricted to canonical
 `/objects/objects/sha256/<shard>/<digest>` CAS keys, with byte ranges and ETags. Mutable
 heads are reachable only by RPC internals. There are no list or write operations and no
-custom `fossil_*` RPC methods. A sparse,
-public, read-only deployment and exact verification commands are documented in the
-[live Base R2/Cloudflare Worker demo](live-demo.md).
+custom `fossil_*` RPC methods. A public, read-only deployment serves an exact sparse
+overlay for documented keys across Base blocks `51,232,601..51,535,000`; it is not
+arbitrary-address-complete. Exact verification commands, publication timing, the
+below-5-GB bucket inventory, and environment-specific (non-SLA) latency medians are
+documented in the [live Base R2/Cloudflare Worker demo](live-demo.md).
 
-The edge implementation is deliberately active-window-only. It rejects completed
-windows and checkpoint fallback explicitly instead of returning a false default. The
-native server remains the full reader for those paths and is also the preferred tier
-for miss-heavy workloads, broad working sets, future EVM execution, and tracing.
+The edge implementation supports bounded completed-window catalog selection and exact
+checkpoint fallback as well as the active window. Worker-specific object caps remain
+stricter than native limits. The native server is still the preferred tier for
+miss-heavy workloads, broad working sets, future EVM execution, and tracing.
 Neither runtime currently implements historical `eth_call`, log filtering, or tracing.
 
 ```text
 one format-v1 archive + shared golden object graph
     |-- native fossil binary (Tokio/Axum/object_store)
-    `-- Rust/WASM Worker (worker-rs/direct R2/active window)
+    `-- Rust/WASM Worker (worker-rs/direct R2/bounded catalog + checkpoint)
 ```
 
 Worker limits vary by plan and release. The implementation enforces a 16 KiB RPC body,

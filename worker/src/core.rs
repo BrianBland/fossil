@@ -13,8 +13,17 @@ const REF_BYTES: usize = 36;
 const ROUTER_PARTITIONS: usize = 128;
 const DATA_PARTITIONS: usize = 32;
 const EPOCHS_PER_WINDOW: usize = 64;
+const CHECKPOINT_SUBSHARDS: usize = 8;
 const MAX_EPOCH_BLOCKS: u64 = 1_000;
 const MAX_DIRECTORY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const CATALOG_CHUNK_ENTRIES: usize = 256;
+const MAX_CATALOG_CHUNKS: usize = 4_096;
+const CHECKPOINT_MANIFEST_BYTES: usize = 4 + 1 + 8 + ROUTER_PARTITIONS * REF_BYTES;
+const CHECKPOINT_PARTITION_MANIFEST_BYTES: usize = 4 + 1 + CHECKPOINT_SUBSHARDS * REF_BYTES;
+// Worker checkpoint shards are deliberately tighter than native's 64 MiB allowance.
+pub const MAX_CHECKPOINT_DECODED: usize = 32 * 1024 * 1024;
+pub const MAX_CHECKPOINT_OBJECT_BYTES: usize = MAX_CHECKPOINT_DECODED + 1024 * 1024;
 // Worker-specific cap; measured demo/real index deltas are far below this bound.
 pub const MAX_INDEX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_ENTRIES: usize = 65_536;
@@ -89,6 +98,7 @@ pub struct Commit {
     pub finalized: bool,
     pub active_window_start: u64,
     active_directory: ObjectRef,
+    completed_catalog: ObjectRef,
     published_hash: [u8; 32],
 }
 
@@ -112,6 +122,37 @@ struct Directory {
     window_start: u64,
     base_checkpoint: ObjectRef,
     epochs: Vec<Epoch>,
+}
+#[derive(Clone, Copy, Debug)]
+struct CheckpointManifest {
+    boundary: u64,
+    partitions: [ObjectRef; ROUTER_PARTITIONS],
+}
+#[derive(Clone, Copy, Debug)]
+struct StatePointer {
+    object: ObjectRef,
+    run_index: u32,
+    version_index: u32,
+}
+#[derive(Clone, Debug)]
+struct CatalogEntry {
+    start: u64,
+    end: u64,
+    directory: ObjectRef,
+}
+#[derive(Clone, Debug)]
+struct CatalogChunk {
+    entries: Vec<CatalogEntry>,
+}
+#[derive(Clone, Debug)]
+struct CatalogRoot {
+    chunks: Vec<(u64, ObjectRef)>,
+}
+#[derive(Clone, Copy, Debug)]
+struct Route {
+    partition: u8,
+    subshard: u8,
+    fingerprint: [u8; 12],
 }
 #[derive(Clone, Copy, Debug)]
 struct IndexCandidate {
@@ -173,7 +214,7 @@ pub struct Reader<'a, S: ObjectStore> {
     prefix: String,
     pub commit: Commit,
     budget: Budget,
-    directory: Option<Directory>,
+    directory: Option<(u64, u64, Directory)>,
     cache: HashMap<String, Vec<u8>>,
     cache_order: VecDeque<String>,
     cache_bytes: usize,
@@ -272,11 +313,6 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
                 "block is outside the published archive range".into(),
             ));
         }
-        if block < self.commit.active_window_start {
-            return Err(ArchiveError::Unavailable(
-                "completed-window lookup is not implemented by this Worker".into(),
-            ));
-        }
         Ok(block)
     }
 
@@ -331,35 +367,72 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
     }
 
     async fn ensure_directory(&mut self, block: u64) -> Result<Directory> {
-        if block < self.commit.active_window_start {
-            return Err(ArchiveError::Unavailable(
-                "completed-window lookup is not implemented by this Worker".into(),
-            ));
+        if let Some((start, end, directory)) = &self.directory {
+            if *start <= block && block <= *end {
+                return Ok(directory.clone());
+            }
         }
-        if let Some(directory) = &self.directory {
-            return Ok(directory.clone());
-        }
-        let bytes = self
-            .get_object(self.commit.active_directory, MAX_DIRECTORY_BYTES)
-            .await?;
-        self.budget.decoded(bytes.len())?;
-        let directory = parse_directory(&bytes)?;
-        let complete = directory_matches_publication(&directory, self.commit.published_number);
-        if directory.window_start != self.commit.active_window_start || !complete {
-            return integrity();
-        }
-        self.directory = Some(directory.clone());
+        let (directory, start, end) = if block >= self.commit.active_window_start {
+            let bytes = self
+                .get_object(self.commit.active_directory, MAX_DIRECTORY_BYTES)
+                .await?;
+            self.budget.decoded(bytes.len())?;
+            let directory = parse_directory(&bytes)?;
+            if directory.window_start != self.commit.active_window_start
+                || !directory_matches_publication(&directory, self.commit.published_number)
+            {
+                return integrity();
+            }
+            (
+                directory,
+                self.commit.active_window_start,
+                self.commit.published_number,
+            )
+        } else {
+            if self.commit.completed_catalog.empty() {
+                return Err(ArchiveError::Unavailable("block is unavailable".into()));
+            }
+            let bytes = self
+                .get_object(self.commit.completed_catalog, MAX_CATALOG_BYTES)
+                .await?;
+            self.budget.decoded(bytes.len())?;
+            let root = parse_catalog_root(&bytes)?;
+            let position = root.chunks.partition_point(|(start, _)| *start <= block);
+            let index = position
+                .checked_sub(1)
+                .ok_or_else(|| ArchiveError::Unavailable("block is unavailable".into()))?;
+            let chunk_ref = root.chunks[index].1;
+            let bytes = self.get_object(chunk_ref, MAX_CATALOG_BYTES).await?;
+            self.budget.decoded(bytes.len())?;
+            let chunk = parse_catalog_chunk(&bytes)?;
+            let entry = chunk
+                .entries
+                .iter()
+                .find(|entry| entry.start <= block && block <= entry.end)
+                .ok_or_else(|| ArchiveError::Unavailable("block is unavailable".into()))?;
+            let bytes = self
+                .get_object(entry.directory, MAX_DIRECTORY_BYTES)
+                .await?;
+            self.budget.decoded(bytes.len())?;
+            let directory = parse_directory(&bytes)?;
+            let actual_end = directory.epochs.last().ok_or(ArchiveError::Integrity)?.end;
+            if entry.start != directory.window_start || entry.end != actual_end {
+                return integrity();
+            }
+            (directory, entry.start, entry.end)
+        };
+        self.directory = Some((start, end, directory.clone()));
         Ok(directory)
     }
 
     async fn lookup_raw(&mut self, key: &[u8], block: u64) -> Result<Option<Version>> {
         let directory = self.ensure_directory(block).await?;
-        let (partition, fingerprint) = route_key(key)?;
+        let route = route_key(key)?;
         for epoch in directory.epochs.iter().rev() {
             if epoch.start > block {
                 continue;
             }
-            let index_ref = epoch.indexes[partition as usize];
+            let index_ref = epoch.indexes[route.partition as usize];
             if index_ref.empty() {
                 continue;
             }
@@ -368,14 +441,14 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
             }
             let bytes = self.get_uncached_object(index_ref, MAX_INDEX_BYTES).await?;
             self.budget.decoded(bytes.len())?;
-            let index = parse_index_candidates(&bytes, fingerprint, block)?;
+            let index = parse_index_candidates(&bytes, route.fingerprint, block)?;
             drop(bytes);
-            if index.partition != partition || index.epoch_start != epoch.start {
+            if index.partition != route.partition || index.epoch_start != epoch.start {
                 return integrity();
             }
             for entry in index.candidates {
                 let data_ref = index.dictionary[entry.dictionary_index as usize];
-                if data_ref != epoch.data[partition as usize >> 2] {
+                if data_ref != epoch.data[route.partition as usize >> 2] {
                     return integrity();
                 }
                 if data_ref.length as usize > MAX_DATA_OBJECT_BYTES {
@@ -389,12 +462,48 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
                 }
             }
         }
-        if !directory.base_checkpoint.empty() {
-            return Err(ArchiveError::Unavailable(
-                "checkpoint fallback is not implemented by this Worker".into(),
-            ));
+        let checkpoint = directory.base_checkpoint;
+        if checkpoint.empty() {
+            return Ok(None);
         }
-        Ok(None)
+        let bytes = self
+            .get_object(checkpoint, CHECKPOINT_MANIFEST_BYTES)
+            .await?;
+        self.budget.decoded(bytes.len())?;
+        let manifest = parse_checkpoint_manifest(&bytes)?;
+        let expected_boundary = directory
+            .window_start
+            .checked_sub(1)
+            .ok_or(ArchiveError::Integrity)?;
+        if manifest.boundary != expected_boundary {
+            return integrity();
+        }
+        let partition_manifest = manifest.partitions[route.partition as usize];
+        if partition_manifest.empty() {
+            return Ok(None);
+        }
+        let bytes = self
+            .get_object(partition_manifest, CHECKPOINT_PARTITION_MANIFEST_BYTES)
+            .await?;
+        self.budget.decoded(bytes.len())?;
+        let subshards = parse_checkpoint_partition_manifest(&bytes)?;
+        let subshard = subshards[route.subshard as usize];
+        if subshard.empty() {
+            return Ok(None);
+        }
+        let bytes = self
+            .get_uncached_object(subshard, MAX_CHECKPOINT_OBJECT_BYTES)
+            .await?;
+        let pointer = parse_checkpoint_lookup(&bytes, &mut self.budget, key)?;
+        drop(bytes);
+        let Some(pointer) = pointer else {
+            return Ok(None);
+        };
+        let bytes = self
+            .get_object(pointer.object, MAX_DATA_OBJECT_BYTES)
+            .await?;
+        parse_data_checkpoint_lookup(&bytes, &mut self.budget, pointer, key, manifest.boundary)
+            .map(Some)
     }
 
     pub async fn account_at(&mut self, address: [u8; 20], block: u64) -> Result<Option<Account>> {
@@ -511,7 +620,8 @@ fn parse_commit(bytes: &[u8]) -> Result<Commit> {
     let active_window_start = c.u64()?;
     let active_directory = c.object_ref()?;
     validate_ref(active_directory, false)?;
-    validate_ref(c.object_ref()?, true)?;
+    let completed_catalog = c.object_ref()?;
+    validate_ref(completed_catalog, true)?;
     c.end()?;
     Ok(Commit {
         generation,
@@ -521,6 +631,7 @@ fn parse_commit(bytes: &[u8]) -> Result<Commit> {
         finalized,
         active_window_start,
         active_directory,
+        completed_catalog,
         published_hash,
     })
 }
@@ -574,6 +685,98 @@ fn parse_directory(bytes: &[u8]) -> Result<Directory> {
         base_checkpoint,
         epochs,
     })
+}
+
+fn parse_catalog_root(bytes: &[u8]) -> Result<CatalogRoot> {
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(ArchiveError::Limit);
+    }
+    let mut c = Cursor::new(bytes);
+    c.expect(b"FSEW")?;
+    c.version()?;
+    let count = c.count(8 + REF_BYTES)?;
+    if count == 0 || count > MAX_CATALOG_CHUNKS {
+        return integrity();
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let start = c.u64()?;
+        let reference = c.object_ref()?;
+        validate_ref(reference, false)?;
+        chunks.push((start, reference));
+    }
+    c.end()?;
+    if !chunks.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return integrity();
+    }
+    Ok(CatalogRoot { chunks })
+}
+
+fn parse_catalog_chunk(bytes: &[u8]) -> Result<CatalogChunk> {
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(ArchiveError::Limit);
+    }
+    let mut c = Cursor::new(bytes);
+    c.expect(b"FSWC")?;
+    c.version()?;
+    let count = c.count(16 + REF_BYTES)?;
+    if count == 0 || count > CATALOG_CHUNK_ENTRIES {
+        return integrity();
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry = CatalogEntry {
+            start: c.u64()?,
+            end: c.u64()?,
+            directory: c.object_ref()?,
+        };
+        validate_ref(entry.directory, false)?;
+        if entry.end < entry.start {
+            return integrity();
+        }
+        entries.push(entry);
+    }
+    c.end()?;
+    if !entries.windows(2).all(|pair| pair[0].end < pair[1].start) {
+        return integrity();
+    }
+    Ok(CatalogChunk { entries })
+}
+
+fn parse_checkpoint_manifest(bytes: &[u8]) -> Result<CheckpointManifest> {
+    if bytes.len() != CHECKPOINT_MANIFEST_BYTES {
+        return integrity();
+    }
+    let mut c = Cursor::new(bytes);
+    c.expect(b"FSEM")?;
+    c.version()?;
+    let boundary = c.u64()?;
+    let mut partitions = [ObjectRef::default(); ROUTER_PARTITIONS];
+    for reference in &mut partitions {
+        *reference = c.object_ref()?;
+        validate_ref(*reference, true)?;
+    }
+    c.end()?;
+    Ok(CheckpointManifest {
+        boundary,
+        partitions,
+    })
+}
+
+fn parse_checkpoint_partition_manifest(bytes: &[u8]) -> Result<[ObjectRef; CHECKPOINT_SUBSHARDS]> {
+    if bytes.len() != CHECKPOINT_PARTITION_MANIFEST_BYTES {
+        return integrity();
+    }
+    let mut c = Cursor::new(bytes);
+    c.expect(b"FSPS")?;
+    c.version()?;
+    let mut subshards = [ObjectRef::default(); CHECKPOINT_SUBSHARDS];
+    for reference in &mut subshards {
+        *reference = c.object_ref()?;
+        validate_ref(*reference, true)?;
+    }
+    c.end()?;
+    Ok(subshards)
 }
 
 fn validate_index_entry_count(count: usize) -> Result<()> {
@@ -670,6 +873,150 @@ fn validate_data_lengths(
         return integrity();
     }
     Ok(())
+}
+
+fn parse_checkpoint_lookup(
+    bytes: &[u8],
+    budget: &mut Budget,
+    target_key: &[u8],
+) -> Result<Option<StatePointer>> {
+    let mut c = Cursor::new(bytes);
+    c.expect(b"FSEP")?;
+    c.version()?;
+    let decoded_length = c.u32()? as usize;
+    let encoded_length = c.u32()? as usize;
+    if decoded_length > MAX_CHECKPOINT_DECODED {
+        return Err(ArchiveError::Limit);
+    }
+    if encoded_length != c.remaining() {
+        return integrity();
+    }
+    budget.decoded(decoded_length)?;
+    let compressed = c.take(encoded_length)?;
+    c.end()?;
+    let decoder = StreamingDecoder::new_with_max_window_size(
+        IoCursor::new(compressed),
+        MAX_CHECKPOINT_DECODED as u64,
+    )
+    .map_err(|_| ArchiveError::Integrity)?;
+    let mut decoded = Vec::with_capacity(decoded_length.min(1024 * 1024));
+    decoder
+        .take(decoded_length as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|_| ArchiveError::Integrity)?;
+    if decoded.len() != decoded_length {
+        return integrity();
+    }
+
+    // Check the whole shard using borrowed key slices. Canonical producer output is
+    // strictly key-sorted, so duplicate and ordering corruption need no owned map.
+    let mut body = Cursor::new(&decoded);
+    let count = body.count(1 + REF_BYTES + 8)?;
+    let mut prior_key: Option<&[u8]> = None;
+    let mut selected = None;
+    for _ in 0..count {
+        let key = body.bytes()?;
+        if key.is_empty() || prior_key.is_some_and(|prior| prior >= key) {
+            return integrity();
+        }
+        let pointer = StatePointer {
+            object: body.object_ref()?,
+            run_index: body.u32()?,
+            version_index: body.u32()?,
+        };
+        validate_ref(pointer.object, false)?;
+        if key == target_key {
+            selected = Some(pointer);
+        }
+        prior_key = Some(key);
+    }
+    body.end()?;
+    Ok(selected)
+}
+
+fn parse_data_checkpoint_lookup(
+    bytes: &[u8],
+    budget: &mut Budget,
+    pointer: StatePointer,
+    target_key: &[u8],
+    boundary: u64,
+) -> Result<Version> {
+    let mut c = Cursor::new(bytes);
+    c.expect(b"FSED")?;
+    c.version()?;
+    let decoded_length = c.u32()? as usize;
+    let encoded_length = c.u32()? as usize;
+    validate_data_lengths(decoded_length, encoded_length, c.remaining())?;
+    budget.decoded(decoded_length)?;
+    let compressed = c.take(encoded_length)?;
+    c.end()?;
+    let decoder = StreamingDecoder::new_with_max_window_size(
+        IoCursor::new(compressed),
+        MAX_DATA_DECODED as u64,
+    )
+    .map_err(|_| ArchiveError::Integrity)?;
+    let mut decoded = Vec::with_capacity(decoded_length.min(1024 * 1024));
+    decoder
+        .take(decoded_length as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|_| ArchiveError::Integrity)?;
+    if decoded.len() != decoded_length {
+        return integrity();
+    }
+
+    let mut body = Cursor::new(&decoded);
+    let count = body.count(3)?;
+    if pointer.run_index as usize >= count {
+        return integrity();
+    }
+    let mut prior_key: Option<&[u8]> = None;
+    let mut selected: Option<(u64, &[u8])> = None;
+    let mut selected_next_block = None;
+    for run_index in 0..count {
+        let key = body.bytes()?;
+        if key.is_empty() || prior_key.is_some_and(|prior| prior >= key) {
+            return integrity();
+        }
+        let version_count = body.count(2)?;
+        if version_count == 0 {
+            return integrity();
+        }
+        if run_index == pointer.run_index as usize
+            && pointer.version_index as usize >= version_count
+        {
+            return integrity();
+        }
+        let mut block = 0u64;
+        for version_index in 0..version_count {
+            let next = block
+                .checked_add(body.uleb()?)
+                .ok_or(ArchiveError::Integrity)?;
+            if version_index > 0 && next <= block {
+                return integrity();
+            }
+            block = next;
+            let value = body.bytes()?;
+            if run_index == pointer.run_index as usize {
+                if key != target_key {
+                    return integrity();
+                }
+                if version_index == pointer.version_index as usize {
+                    selected = Some((block, value));
+                } else if version_index == pointer.version_index as usize + 1 {
+                    selected_next_block = Some(block);
+                }
+            }
+        }
+        prior_key = Some(key);
+    }
+    body.end()?;
+    let (block, value) = selected.ok_or(ArchiveError::Integrity)?;
+    if block > boundary || selected_next_block.is_some_and(|next| next <= boundary) {
+        return integrity();
+    }
+    Ok(Version {
+        value: value.to_vec(),
+    })
 }
 
 fn parse_data_lookup(
@@ -790,7 +1137,7 @@ fn decode_code_meta(bytes: &[u8]) -> Result<(u64, ObjectRef)> {
     Ok((first_seen, object))
 }
 
-fn route_key(key: &[u8]) -> Result<(u8, [u8; 12])> {
+fn route_key(key: &[u8]) -> Result<Route> {
     let full = Sha256::digest(key);
     let route = match key.first() {
         Some(1 | 2) if key.len() >= 21 => Sha256::digest(&key[1..21]),
@@ -799,7 +1146,11 @@ fn route_key(key: &[u8]) -> Result<(u8, [u8; 12])> {
     };
     let mut fingerprint = [0; 12];
     fingerprint.copy_from_slice(&full[..12]);
-    Ok((route[0] >> 1, fingerprint))
+    Ok(Route {
+        partition: route[0] >> 1,
+        subshard: full[12] >> 5,
+        fingerprint,
+    })
 }
 fn validate_ref(reference: ObjectRef, optional: bool) -> Result<()> {
     if optional && reference.empty() {
@@ -1024,6 +1375,7 @@ mod tests {
                     digest: [1; 32],
                     length: 1,
                 },
+                completed_catalog: ObjectRef::default(),
                 published_hash: [2; 32],
             },
             budget: Budget::default(),
@@ -1083,6 +1435,20 @@ mod tests {
                 Err(ArchiveError::Limit)
             );
             assert_eq!(exhausted_store.0.get(), 0);
+
+            let checkpoint_store = CountingStore(Cell::new(0));
+            let mut checkpoint_reader = reader(&checkpoint_store);
+            let oversized_checkpoint = ObjectRef {
+                digest: [8; 32],
+                length: (MAX_CHECKPOINT_OBJECT_BYTES + 1) as u32,
+            };
+            assert_eq!(
+                checkpoint_reader
+                    .get_uncached_object(oversized_checkpoint, MAX_CHECKPOINT_OBJECT_BYTES)
+                    .await,
+                Err(ArchiveError::Limit)
+            );
+            assert_eq!(checkpoint_store.0.get(), 0);
         });
     }
 

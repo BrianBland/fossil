@@ -44,10 +44,18 @@
   rollback tool, or disaster-recovery tool is included. Superseded active directories,
   commits, and orphans require future offline GC after a rollback window.
 - Memory/filesystem and generic conditional object-store behavior are tested locally.
-  Real R2, AWS S3, and MinIO conditional-write/latency tests remain required.
-- The public, read-only Rust/WASM Cloudflare Worker implements bounded active-window
-  balance, nonce, code, and storage lookups plus chain ID, block number, client version,
-  and an immutable-object gateway under `fossil-demo/`. It does not implement completed
-  windows, checkpoint fallback, logs, calls, tracing, writes, deletes, or listing. The
-  native Tokio/Axum adapter remains the full JSON-RPC server. See the sparse
-  [live demo](live-demo.md).
+  The live week demo adds one real R2 publication and sequential read-latency
+  observation, but broader R2 conditional-write/load testing and AWS S3 and MinIO
+  conditional-write/latency tests remain required. Its Seattle/Mac latency medians are
+  environment-specific observations, not an SLA; raw samples and first/max timing were
+  not retained.
+- The public, read-only Rust/WASM Cloudflare Worker implements bounded active and
+  completed-window balance, nonce, code, and storage lookups, including two-level catalog
+  selection and checkpoint fallback, plus chain ID, block number, client version, and an
+  immutable-object gateway under `fossil-demo/`. Its live 302,400-block query archive is
+  an exact sparse overlay only for the documented Sequencer Fee Vault native balance,
+  WETH contract native ETH balance, and Aerodrome reserve keys. It is not
+  arbitrary-address-complete; the separate `fossil-week-layout` corpus is physical-layout
+  evidence and not directly queryable forward state. The Worker does not implement logs,
+  calls, tracing, writes, deletes, or listing. The native Tokio/Axum adapter remains the
+  full JSON-RPC server. See the [live demo](live-demo.md).

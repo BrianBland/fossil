@@ -21,6 +21,7 @@ worker = "0.8.6"
 [dev-dependencies]
 base64 = "0.22.1"
 futures = "0.3.31"
+zstd = "0.13.3"
 
 [profile.release]
 codegen-units = 1
