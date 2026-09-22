@@ -173,13 +173,13 @@ async fn dispatch_rpc(
         return Err(DispatchError::MethodNotFound);
     }
     let chain_id = configured_chain_id(env)?;
+    if method == "eth_chainId" {
+        require_params(params, 0)?;
+        return Ok(json!(core::quantity(chain_id)));
+    }
     let prefix = archive_prefix(env)?;
     let store = R2Store(env.bucket("ARCHIVE").map_err(|_| ArchiveError::Backend)?);
     let mut reader = Reader::load(&store, prefix, chain_id).await?;
-    if method == "eth_chainId" {
-        require_params(params, 0)?;
-        return Ok(json!(core::quantity(reader.commit.chain_id)));
-    }
     if method == "eth_blockNumber" {
         require_params(params, 0)?;
         return Ok(json!(core::quantity(reader.commit.published_number)));
@@ -238,7 +238,11 @@ fn configured_chain_id(env: &Env) -> core::Result<u64> {
         .var("CHAIN_ID")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "8453".into());
+    parse_configured_chain_id(&text)
+}
+fn parse_configured_chain_id(text: &str) -> core::Result<u64> {
     if text.is_empty()
+        || text == "0"
         || (text.len() > 1 && text.starts_with('0'))
         || !text.bytes().all(|b| b.is_ascii_digit())
     {
@@ -250,7 +254,7 @@ fn archive_prefix(env: &Env) -> core::Result<String> {
     let mut prefix = env
         .var("IMMUTABLE_PREFIX")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "fossil-demo/".into());
+        .unwrap_or_else(|_| "v1/".into());
     if prefix.starts_with('/')
         || prefix.contains(['\\', '\0'])
         || prefix.split('/').any(|part| part == "." || part == "..")
@@ -604,6 +608,17 @@ mod tests {
         assert_eq!(parse_range("bytes=0-1,3-4", 6), RangeRequest::Ignore);
         assert_eq!(parse_range("items=0-1", 6), RangeRequest::Ignore);
         assert_eq!(parse_range("bytes=wat", 6), RangeRequest::Ignore);
+    }
+
+    #[test]
+    fn configured_chain_id_is_strict_positive_decimal() {
+        assert_eq!(parse_configured_chain_id("8453"), Ok(8453));
+        for invalid in ["", "0", "01", "0x2105", "-1", "18446744073709551616"] {
+            assert_eq!(
+                parse_configured_chain_id(invalid),
+                Err(ArchiveError::Backend)
+            );
+        }
     }
 
     #[test]

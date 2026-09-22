@@ -6,9 +6,9 @@ compatibility_date = "2025-02-24"
 command = "worker-build --release --no-panic-recovery"
 
 [vars]
-IMMUTABLE_PREFIX = "fossil-demo/"
+IMMUTABLE_PREFIX = "v1/"
 CHAIN_ID = "8453"
 
 [[r2_buckets]]
 binding = "ARCHIVE"
-bucket_name = "base-mainnet-fossil"
+bucket_name = "fossil"

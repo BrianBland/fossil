@@ -1,8 +1,7 @@
 //! Fossil sealed-epoch archive format version 1.
 //!
-//! Publications append immutable key-major epochs. State-key COW is deliberately
-//! absent: one active-window directory is rewritten per sealed epoch and state is
-//! checkpointed every 64 epochs.
+//! Publications append immutable key-major epochs. One active-window directory is
+//! rewritten per sealed epoch and state is checkpointed every 64 epochs.
 
 use crate::format::{quantity, AccountEvent, Address, BlockMeta, Hash32, StorageEvent};
 use crate::normalized::{Mode, Package};
@@ -10,7 +9,7 @@ use crate::store::{ArchiveStore, VersionedBytes};
 use anyhow::{anyhow, bail, Context, Result};
 use moka::sync::Cache;
 use sha3::{Digest as _, Keccak256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -44,8 +43,10 @@ const ROUTER_PARTITIONS: usize = 128;
 const DATA_PARTITIONS: usize = 32;
 const EPOCHS_PER_WINDOW: usize = 64;
 const MAX_EPOCH_BLOCKS: u64 = 1_000;
-const MAX_DATA_DECODED: usize = 64 * 1024 * 1024;
-const MAX_DATA_OBJECT_BYTES: usize = MAX_DATA_DECODED + 1024 * 1024;
+// These publication caps are shared with the isolate-constrained Worker. Native
+// publishers must never create a format-v1 archive that the Worker cannot read.
+const MAX_DATA_DECODED: usize = 8 * 1024 * 1024;
+const MAX_DATA_OBJECT_BYTES: usize = MAX_DATA_DECODED + 256 * 1024;
 const MAX_CHECKPOINT_SHARD_DECODED: usize = 64 * 1024 * 1024;
 const MAX_CHECKPOINT_OBJECT_BYTES: usize = MAX_CHECKPOINT_SHARD_DECODED + 1024 * 1024;
 const MAX_BLOCK_DECODED: usize = 16 * 1024 * 1024;
@@ -53,8 +54,16 @@ const MAX_BLOCK_OBJECT_BYTES: usize = MAX_BLOCK_DECODED + 1024 * 1024;
 const MAX_CODE_OBJECT_BYTES: usize = 1024 * 1024;
 const CHECKPOINT_MANIFEST_BYTES: usize = 4 + 1 + 8 + ROUTER_PARTITIONS * REF_BYTES;
 const CHECKPOINT_SHARD_TARGET: usize = 32 * 1024 * 1024;
-const CHECKPOINT_SUBSHARDS: usize = 8;
-const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
+const MIN_CHECKPOINT_SUBSHARDS: usize = 8;
+const MAX_CHECKPOINT_SUBSHARDS: usize = 256;
+const LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES: usize =
+    4 + 1 + MIN_CHECKPOINT_SUBSHARDS * REF_BYTES;
+const MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES: usize =
+    4 + 1 + 2 + MAX_CHECKPOINT_SUBSHARDS * REF_BYTES;
+const CHECKPOINT_BUILD_CACHE_MAX_ITEMS: usize = 2;
+const CHECKPOINT_BUILD_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INDEX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INDEX_ENTRIES: usize = 65_536;
 const MAX_DIRECTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const CATALOG_CHUNK_ENTRIES: usize = 256;
@@ -291,6 +300,13 @@ struct CheckpointBuildStats {
 }
 
 #[derive(Default)]
+struct CheckpointDataCache {
+    objects: BTreeMap<Hash32, (DataObject, usize)>,
+    order: VecDeque<Hash32>,
+    decoded_bytes: usize,
+}
+
+#[derive(Default)]
 struct LookupBudget {
     remote_gets: u64,
     decoded_bytes: u64,
@@ -320,7 +336,6 @@ impl LookupBudget {
 #[derive(Clone, Copy)]
 struct Route {
     partition: u8,
-    subshard: u8,
     fingerprint: [u8; 12],
 }
 
@@ -338,9 +353,27 @@ fn route_key(key: &[u8]) -> Result<Route> {
     };
     Ok(Route {
         partition,
-        subshard: full[12] >> 5,
         fingerprint: full[..12].try_into().unwrap(),
     })
+}
+
+fn validate_checkpoint_subshard_count(count: usize) -> Result<()> {
+    if !(MIN_CHECKPOINT_SUBSHARDS..=MAX_CHECKPOINT_SUBSHARDS).contains(&count)
+        || !count.is_power_of_two()
+    {
+        bail!(
+            "checkpoint subshard count must be a power of two between {} and {}",
+            MIN_CHECKPOINT_SUBSHARDS,
+            MAX_CHECKPOINT_SUBSHARDS
+        );
+    }
+    Ok(())
+}
+
+fn checkpoint_subshard(key: &[u8], count: usize) -> Result<usize> {
+    validate_checkpoint_subshard_count(count)?;
+    let hash = Hash32::digest(key).0;
+    Ok(hash[12] as usize >> (8 - count.trailing_zeros() as usize))
 }
 
 fn full_key(namespace: u8, logical: &[u8]) -> Vec<u8> {
@@ -366,7 +399,12 @@ fn encode_data(runs: &BTreeMap<Vec<u8>, Vec<Version>>) -> Result<Vec<u8>> {
             previous = version.block;
         }
     }
-    encode_compressed(DATA_MAGIC, &body, MAX_DATA_DECODED)
+    let encoded = encode_compressed(DATA_MAGIC, &body, MAX_DATA_DECODED)
+        .context("data object exceeds Worker 8 MiB decoded publication cap")?;
+    if encoded.len() > MAX_DATA_OBJECT_BYTES {
+        bail!("data object exceeds Worker 8.25 MiB encoded publication cap");
+    }
+    Ok(encoded)
 }
 
 fn decode_data(reference: ObjectRef, bytes: &[u8]) -> Result<DataObject> {
@@ -452,6 +490,9 @@ pub fn decode_blocks(reference: ObjectRef, bytes: &[u8]) -> Result<Vec<BlockMeta
 }
 
 fn encode_index(index: &IndexDelta) -> Result<Vec<u8>> {
+    if index.entries.len() > MAX_INDEX_ENTRIES {
+        bail!("index delta exceeds Worker 65,536-entry publication cap");
+    }
     let mut out = Vec::new();
     out.extend_from_slice(INDEX_MAGIC);
     out.push(VERSION);
@@ -476,7 +517,7 @@ fn encode_index(index: &IndexDelta) -> Result<Vec<u8>> {
         put_u32(&mut out, entry.run_index);
     }
     if out.len() > MAX_INDEX_BYTES {
-        bail!("index delta exceeds bound");
+        bail!("index delta exceeds Worker 2 MiB encoded publication cap");
     }
     Ok(out)
 }
@@ -505,6 +546,9 @@ fn decode_index(reference: ObjectRef, bytes: &[u8]) -> Result<IndexDelta> {
         dictionary.push(item);
     }
     let entry_count = bounded_count(&mut input, 18, "index entries")?;
+    if entry_count > MAX_INDEX_ENTRIES {
+        bail!("index delta exceeds shared 65,536-entry format cap");
+    }
     let mut entries = Vec::new();
     entries.try_reserve_exact(entry_count)?;
     for _ in 0..entry_count {
@@ -625,6 +669,58 @@ fn decode_directory(reference: ObjectRef, bytes: &[u8]) -> Result<Directory> {
     })
 }
 
+fn uleb_encoded_len(mut value: usize) -> usize {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
+    }
+    bytes
+}
+
+fn checkpoint_entry_decoded_len(key: &[u8]) -> Result<usize> {
+    uleb_encoded_len(key.len())
+        .checked_add(key.len())
+        .and_then(|length| length.checked_add(REF_BYTES + 8))
+        .context("checkpoint entry decoded length overflow")
+}
+
+fn select_checkpoint_subshard_count(
+    entries: &BTreeMap<Vec<u8>, StatePointer>,
+    target: usize,
+) -> Result<usize> {
+    let mut count = MIN_CHECKPOINT_SUBSHARDS;
+    loop {
+        let mut item_counts = vec![0usize; count];
+        let mut lengths = vec![0usize; count];
+        for key in entries.keys() {
+            let shard = checkpoint_subshard(key, count)?;
+            item_counts[shard] += 1;
+            lengths[shard] = lengths[shard]
+                .checked_add(checkpoint_entry_decoded_len(key)?)
+                .context("checkpoint shard decoded length overflow")?;
+        }
+        let largest = lengths
+            .into_iter()
+            .zip(item_counts)
+            .map(|(length, items)| length + uleb_encoded_len(items))
+            .max()
+            .unwrap_or(1);
+        if largest <= target {
+            return Ok(count);
+        }
+        if count == MAX_CHECKPOINT_SUBSHARDS {
+            bail!(
+                "checkpoint partition capacity exceeded: a shard remains {} bytes with {} subshards ({} MiB decoded writer target)",
+                largest,
+                MAX_CHECKPOINT_SUBSHARDS,
+                CHECKPOINT_SHARD_TARGET / (1024 * 1024)
+            );
+        }
+        count *= 2;
+    }
+}
+
 fn encode_checkpoint_partition(entries: &BTreeMap<Vec<u8>, StatePointer>) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     put_uleb(&mut body, entries.len() as u64);
@@ -669,22 +765,24 @@ fn decode_checkpoint_partition(
     Ok(entries)
 }
 
-fn encode_checkpoint_partition_manifest(subshards: &[ObjectRef; CHECKPOINT_SUBSHARDS]) -> Vec<u8> {
+fn encode_checkpoint_partition_manifest(subshards: &[ObjectRef]) -> Result<Vec<u8>> {
+    validate_checkpoint_subshard_count(subshards.len())?;
     let mut out = Vec::new();
     out.extend_from_slice(CHECKPOINT_PARTITION_MAGIC);
     out.push(VERSION);
+    out.extend_from_slice(&(subshards.len() as u16).to_be_bytes());
     for reference in subshards {
         put_ref(&mut out, *reference);
     }
-    out
+    Ok(out)
 }
 
 fn decode_checkpoint_partition_manifest(
     reference: ObjectRef,
     bytes: &[u8],
-) -> Result<[ObjectRef; CHECKPOINT_SUBSHARDS]> {
+) -> Result<Vec<ObjectRef>> {
     verify_object(reference, bytes)?;
-    if bytes.len() > 1024 {
+    if bytes.len() > MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES {
         bail!("checkpoint partition manifest exceeds bound");
     }
     let mut input = Cursor::new(bytes);
@@ -692,10 +790,25 @@ fn decode_checkpoint_partition_manifest(
     if input.byte()? != VERSION {
         bail!("unsupported checkpoint partition manifest version");
     }
-    let mut subshards = [ObjectRef::default(); CHECKPOINT_SUBSHARDS];
-    for item in &mut subshards {
-        *item = input.object_ref()?;
-        validate_optional_ref(*item)?;
+    let (count, expected_bytes) = if bytes.len() == LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES {
+        (
+            MIN_CHECKPOINT_SUBSHARDS,
+            LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES,
+        )
+    } else {
+        let count = input.u16()? as usize;
+        validate_checkpoint_subshard_count(count)?;
+        (count, 4 + 1 + 2 + count * REF_BYTES)
+    };
+    if bytes.len() != expected_bytes {
+        bail!("checkpoint partition manifest length does not match subshard count");
+    }
+    let mut subshards = Vec::new();
+    subshards.try_reserve_exact(count)?;
+    for _ in 0..count {
+        let item = input.object_ref()?;
+        validate_optional_ref(item)?;
+        subshards.push(item);
     }
     input.end()?;
     Ok(subshards)
@@ -1264,7 +1377,8 @@ async fn build_checkpoint(
         let mut state: BTreeMap<Vec<u8>, StatePointer> = BTreeMap::new();
         if !base_partitions[partition].is_empty() {
             let manifest_ref = base_partitions[partition];
-            let bytes = get_verified(store, manifest_ref, 1024).await?;
+            let bytes =
+                get_verified(store, manifest_ref, MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES).await?;
             let subshards = decode_checkpoint_partition_manifest(manifest_ref, &bytes)?;
             for reference in subshards.into_iter().filter(|item| !item.is_empty()) {
                 let bytes = get_verified(store, reference, MAX_CHECKPOINT_OBJECT_BYTES).await?;
@@ -1301,7 +1415,7 @@ async fn build_checkpoint(
         // Accounts and every storage incarnation share this primary partition.
         // Resolve final account state, then retain storage only for a live account's
         // final incarnation. Historical epoch objects remain untouched.
-        let mut decoded_cache: BTreeMap<Hash32, DataObject> = BTreeMap::new();
+        let mut decoded_cache = CheckpointDataCache::default();
         let mut accounts: BTreeMap<[u8; 20], u64> = BTreeMap::new();
         for (key, pointer) in state
             .iter()
@@ -1331,13 +1445,14 @@ async fn build_checkpoint(
         stats.peak_partition_estimated_bytes =
             stats.peak_partition_estimated_bytes.max(estimated_bytes);
 
+        let subshard_count = select_checkpoint_subshard_count(&state, CHECKPOINT_SHARD_TARGET)?;
         let mut subgroups: Vec<BTreeMap<Vec<u8>, StatePointer>> =
-            (0..CHECKPOINT_SUBSHARDS).map(|_| BTreeMap::new()).collect();
+            (0..subshard_count).map(|_| BTreeMap::new()).collect();
         for (key, pointer) in state {
-            let route = route_key(&key)?;
-            subgroups[route.subshard as usize].insert(key, pointer);
+            let subshard = checkpoint_subshard(&key, subshard_count)?;
+            subgroups[subshard].insert(key, pointer);
         }
-        let mut subshards = [ObjectRef::default(); CHECKPOINT_SUBSHARDS];
+        let mut subshards = vec![ObjectRef::default(); subshard_count];
         for (subshard, entries) in subgroups.into_iter().enumerate() {
             if entries.is_empty() {
                 continue;
@@ -1349,7 +1464,7 @@ async fn build_checkpoint(
             subshards[subshard] = reference;
         }
         if subshards.iter().any(|item| !item.is_empty()) {
-            let bytes = encode_checkpoint_partition_manifest(&subshards);
+            let bytes = encode_checkpoint_partition_manifest(&subshards)?;
             let reference = put_object(store, &bytes).await?;
             stats.partition_manifest_objects += 1;
             stats.partition_manifest_bytes += bytes.len() as u64;
@@ -1371,13 +1486,32 @@ async fn build_checkpoint(
 async fn pointer_value(
     store: &dyn ArchiveStore,
     pointer: StatePointer,
-    cache: &mut BTreeMap<Hash32, DataObject>,
+    cache: &mut CheckpointDataCache,
 ) -> Result<Vec<u8>> {
-    if cache.get(&pointer.object.digest).is_none() {
+    if !cache.objects.contains_key(&pointer.object.digest) {
         let bytes = get_verified(store, pointer.object, MAX_DATA_OBJECT_BYTES).await?;
-        cache.insert(pointer.object.digest, decode_data(pointer.object, &bytes)?);
+        let decoded_bytes = compressed_decoded_len(&bytes, MAX_DATA_DECODED)?;
+        let data = decode_data(pointer.object, &bytes)?;
+        while cache.objects.len() >= CHECKPOINT_BUILD_CACHE_MAX_ITEMS
+            || cache.decoded_bytes + decoded_bytes > CHECKPOINT_BUILD_CACHE_MAX_BYTES
+        {
+            let digest = cache
+                .order
+                .pop_front()
+                .context("checkpoint data cache accounting is inconsistent")?;
+            let (_, evicted_bytes) = cache
+                .objects
+                .remove(&digest)
+                .context("checkpoint data cache entry is missing")?;
+            cache.decoded_bytes -= evicted_bytes;
+        }
+        cache.order.push_back(pointer.object.digest);
+        cache.decoded_bytes += decoded_bytes;
+        cache
+            .objects
+            .insert(pointer.object.digest, (data, decoded_bytes));
     }
-    let data = &cache[&pointer.object.digest];
+    let data = &cache.objects[&pointer.object.digest].0;
     let (_, versions) = data
         .runs
         .get(pointer.run_index as usize)
@@ -1784,10 +1918,16 @@ impl Publication {
         if partition_manifest.is_empty() {
             return Ok(None);
         }
-        let bytes = self.fetch(partition_manifest, 1024, budget).await?;
+        let bytes = self
+            .fetch(
+                partition_manifest,
+                MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES,
+                budget,
+            )
+            .await?;
         budget.decoded(bytes.len())?;
         let subshards = decode_checkpoint_partition_manifest(partition_manifest, &bytes)?;
-        let subshard = subshards[route.subshard as usize];
+        let subshard = subshards[checkpoint_subshard(key, subshards.len())?];
         if subshard.is_empty() {
             return Ok(None);
         }
@@ -2093,6 +2233,9 @@ impl<'a> Cursor<'a> {
     fn byte(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -2294,6 +2437,203 @@ mod tests {
         assert_eq!(expected[4], 1);
         assert_eq!(head.encode(), expected);
         assert_eq!(Head::decode(&expected).unwrap(), head);
+
+        let partition_manifest =
+            encode_checkpoint_partition_manifest(&[ObjectRef::default(); 8]).unwrap();
+        assert_eq!(&partition_manifest[..7], b"FSPS\x01\x00\x08");
+        assert_eq!(partition_manifest.len(), 4 + 1 + 2 + 8 * REF_BYTES);
+        let partition_ref = ObjectRef {
+            digest: Hash32::digest(&partition_manifest),
+            length: partition_manifest.len() as u32,
+        };
+        assert_eq!(
+            decode_checkpoint_partition_manifest(partition_ref, &partition_manifest)
+                .unwrap()
+                .len(),
+            8
+        );
+
+        let mut legacy_partition_manifest = b"FSPS\x01".to_vec();
+        for _ in 0..8 {
+            put_ref(&mut legacy_partition_manifest, ObjectRef::default());
+        }
+        assert_eq!(
+            legacy_partition_manifest.len(),
+            LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES
+        );
+        assert_eq!(legacy_partition_manifest.len(), 293);
+        let legacy_ref = ObjectRef {
+            digest: Hash32::digest(&legacy_partition_manifest),
+            length: legacy_partition_manifest.len() as u32,
+        };
+        assert_eq!(
+            decode_checkpoint_partition_manifest(legacy_ref, &legacy_partition_manifest)
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn synthetic_oversized_checkpoint_partition_forces_8_to_16_and_rejects_bad_counts() {
+        let pointer = StatePointer {
+            object: ObjectRef {
+                digest: Hash32([1; 32]),
+                length: 1,
+            },
+            run_index: 0,
+            version_index: 0,
+        };
+        let mut first_by_route: BTreeMap<(u8, usize), (Vec<u8>, usize)> = BTreeMap::new();
+        let mut selected = None;
+        for value in 0u32..100_000 {
+            let mut address = [0u8; 20];
+            address[16..].copy_from_slice(&value.to_be_bytes());
+            let key = full_key(NS_ACCOUNT, &address);
+            let route = route_key(&key).unwrap();
+            let shard8 = checkpoint_subshard(&key, 8).unwrap();
+            let shard16 = checkpoint_subshard(&key, 16).unwrap();
+            if let Some((other, other16)) = first_by_route.get(&(route.partition, shard8)) {
+                if *other16 != shard16 {
+                    selected = Some((other.clone(), key));
+                    break;
+                }
+            } else {
+                first_by_route.insert((route.partition, shard8), (key, shard16));
+            }
+        }
+        let (left, right) = selected.expect("find keys that split on the fourth hash bit");
+        assert_eq!(
+            route_key(&left).unwrap().partition,
+            route_key(&right).unwrap().partition
+        );
+        assert_eq!(
+            checkpoint_subshard(&left, 8).unwrap(),
+            checkpoint_subshard(&right, 8).unwrap()
+        );
+        assert_ne!(
+            checkpoint_subshard(&left, 16).unwrap(),
+            checkpoint_subshard(&right, 16).unwrap()
+        );
+        let mut state = BTreeMap::new();
+        state.insert(left.clone(), pointer);
+        state.insert(right, pointer);
+        // Scale the production byte target down to one entry: the exact decoded-body
+        // sizing path sees the 8-way shard as oversized and the 16-way split as valid.
+        let one_entry_target = checkpoint_entry_decoded_len(&left).unwrap() + 1;
+        assert_eq!(
+            select_checkpoint_subshard_count(&state, one_entry_target).unwrap(),
+            16
+        );
+        assert!(select_checkpoint_subshard_count(&state, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("capacity exceeded"));
+
+        let mut malformed = encode_checkpoint_partition_manifest(&vec![
+            ObjectRef::default();
+            MIN_CHECKPOINT_SUBSHARDS
+        ])
+        .unwrap();
+        malformed[5..7].copy_from_slice(&12u16.to_be_bytes());
+        let reference = ObjectRef {
+            digest: Hash32::digest(&malformed),
+            length: malformed.len() as u32,
+        };
+        let malformed_error =
+            decode_checkpoint_partition_manifest(reference, &malformed).unwrap_err();
+        assert!(!malformed_error.to_string().contains("exceeds bound"));
+        let oversized = vec![0; MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES + 1];
+        let oversized_ref = ObjectRef {
+            digest: Hash32::digest(&oversized),
+            length: oversized.len() as u32,
+        };
+        assert!(
+            decode_checkpoint_partition_manifest(oversized_ref, &oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds bound")
+        );
+        assert!(validate_checkpoint_subshard_count(4).is_err());
+        assert!(validate_checkpoint_subshard_count(512).is_err());
+    }
+
+    #[test]
+    fn native_publication_enforces_shared_worker_data_and_index_caps() {
+        assert_eq!(MAX_DATA_DECODED, 8 * 1024 * 1024);
+        assert_eq!(MAX_DATA_OBJECT_BYTES, MAX_DATA_DECODED + 256 * 1024);
+        assert_eq!(MAX_INDEX_BYTES, 2 * 1024 * 1024);
+
+        let mut runs = BTreeMap::new();
+        runs.insert(
+            full_key(NS_ACCOUNT, &[1; 20]),
+            vec![Version {
+                block: 1,
+                value: vec![0; MAX_DATA_DECODED],
+            }],
+        );
+        assert!(encode_data(&runs)
+            .unwrap_err()
+            .to_string()
+            .contains("Worker 8 MiB decoded publication cap"));
+
+        let reference = ObjectRef {
+            digest: Hash32([1; 32]),
+            length: 1,
+        };
+        let entry = IndexEntry {
+            fingerprint: [0; 12],
+            first_block: 0,
+            dictionary_index: 0,
+            run_index: 0,
+        };
+        let index = IndexDelta {
+            partition: 0,
+            epoch_start: 0,
+            dictionary: vec![reference],
+            entries: vec![entry; MAX_INDEX_ENTRIES + 1],
+        };
+        assert!(encode_index(&index)
+            .unwrap_err()
+            .to_string()
+            .contains("65,536-entry publication cap"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_builder_decoded_data_cache_evicts_per_partition() {
+        let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
+        let mut pointers = Vec::new();
+        for value in 1..=3u8 {
+            let key = full_key(NS_ACCOUNT, &[value; 20]);
+            let mut runs = BTreeMap::new();
+            runs.insert(
+                key,
+                vec![Version {
+                    block: 1,
+                    value: vec![value],
+                }],
+            );
+            let bytes = encode_data(&runs).unwrap();
+            let reference = put_object(store.as_ref(), &bytes).await.unwrap();
+            pointers.push(StatePointer {
+                object: reference,
+                run_index: 0,
+                version_index: 0,
+            });
+        }
+        let mut cache = CheckpointDataCache::default();
+        for (expected, pointer) in (1..=3u8).zip(pointers.iter().copied()) {
+            assert_eq!(
+                pointer_value(store.as_ref(), pointer, &mut cache)
+                    .await
+                    .unwrap(),
+                vec![expected]
+            );
+            assert!(cache.objects.len() <= CHECKPOINT_BUILD_CACHE_MAX_ITEMS);
+            assert!(cache.decoded_bytes <= CHECKPOINT_BUILD_CACHE_MAX_BYTES);
+        }
+        assert_eq!(cache.objects.len(), CHECKPOINT_BUILD_CACHE_MAX_ITEMS);
+        assert!(!cache.objects.contains_key(&pointers[0].object.digest));
     }
 
     #[test]
@@ -2630,6 +2970,27 @@ mod tests {
         .await
         .unwrap();
         let manifest = decode_checkpoint_manifest(active.base_checkpoint, &manifest_bytes).unwrap();
+        let mut legacy_partitions = [ObjectRef::default(); ROUTER_PARTITIONS];
+        for (partition, reference) in manifest.partitions.iter().copied().enumerate() {
+            if reference.is_empty() {
+                continue;
+            }
+            let bytes = get_verified(
+                store.as_ref(),
+                reference,
+                MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES,
+            )
+            .await
+            .unwrap();
+            let subshards = decode_checkpoint_partition_manifest(reference, &bytes).unwrap();
+            assert_eq!(subshards.len(), MIN_CHECKPOINT_SUBSHARDS);
+            let mut legacy = b"FSPS\x01".to_vec();
+            for subshard in subshards {
+                put_ref(&mut legacy, subshard);
+            }
+            assert_eq!(legacy.len(), LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES);
+            legacy_partitions[partition] = put_object(store.as_ref(), &legacy).await.unwrap();
+        }
         let mut storage_logical = Address([7; 20]).0.to_vec();
         storage_logical.extend_from_slice(&0_u64.to_be_bytes());
         storage_logical.extend_from_slice(&slot.0);
@@ -2637,11 +2998,15 @@ mod tests {
         let route = route_key(&old_storage_key).unwrap();
         let partition_ref = manifest.partitions[route.partition as usize];
         if !partition_ref.is_empty() {
-            let bytes = get_verified(store.as_ref(), partition_ref, 1024)
-                .await
-                .unwrap();
+            let bytes = get_verified(
+                store.as_ref(),
+                partition_ref,
+                MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES,
+            )
+            .await
+            .unwrap();
             let subshards = decode_checkpoint_partition_manifest(partition_ref, &bytes).unwrap();
-            let shard = subshards[route.subshard as usize];
+            let shard = subshards[checkpoint_subshard(&old_storage_key, subshards.len()).unwrap()];
             if !shard.is_empty() {
                 let bytes = get_verified(store.as_ref(), shard, MAX_CHECKPOINT_OBJECT_BYTES)
                     .await
@@ -2652,23 +3017,24 @@ mod tests {
         }
         let far_checkpoint = put_object(
             store.as_ref(),
-            &encode_checkpoint_manifest(4_999_000, &manifest.partitions),
+            &encode_checkpoint_manifest(4_999_000, &legacy_partitions),
         )
         .await
         .unwrap();
+        let far_epoch = EpochDescriptor {
+            start: 4_999_001,
+            end: 5_000_000,
+            blocks: ObjectRef {
+                digest: Hash32([11; 32]),
+                length: 1,
+            },
+            data: [ObjectRef::default(); DATA_PARTITIONS],
+            indexes: [ObjectRef::default(); ROUTER_PARTITIONS],
+        };
         let far_directory = Directory {
             window_start: 4_999_001,
             base_checkpoint: far_checkpoint,
-            epochs: vec![EpochDescriptor {
-                start: 4_999_001,
-                end: 5_000_000,
-                blocks: ObjectRef {
-                    digest: Hash32([11; 32]),
-                    length: 1,
-                },
-                data: [ObjectRef::default(); DATA_PARTITIONS],
-                indexes: [ObjectRef::default(); ROUTER_PARTITIONS],
-            }],
+            epochs: vec![far_epoch.clone()],
         };
         let far_directory = put_object(store.as_ref(), &encode_directory(&far_directory).unwrap())
             .await
@@ -2688,6 +3054,63 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        // A rollover can consume the fixed-eight legacy manifests and emits only
+        // the current count-bearing adaptive form.
+        let (rolled_checkpoint, _) = build_checkpoint(store.as_ref(), far_checkpoint, &[far_epoch])
+            .await
+            .unwrap();
+        let rolled_bytes =
+            get_verified(store.as_ref(), rolled_checkpoint, CHECKPOINT_MANIFEST_BYTES)
+                .await
+                .unwrap();
+        let rolled_manifest = decode_checkpoint_manifest(rolled_checkpoint, &rolled_bytes).unwrap();
+        for reference in rolled_manifest
+            .partitions
+            .iter()
+            .copied()
+            .filter(|reference| !reference.is_empty())
+        {
+            let bytes = get_verified(
+                store.as_ref(),
+                reference,
+                MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES,
+            )
+            .await
+            .unwrap();
+            assert_eq!(&bytes[..7], b"FSPS\x01\x00\x08");
+        }
+        let rolled_directory = put_object(
+            store.as_ref(),
+            &encode_directory(&Directory {
+                window_start: 5_000_001,
+                base_checkpoint: rolled_checkpoint,
+                epochs: vec![EpochDescriptor {
+                    start: 5_000_001,
+                    end: 5_001_000,
+                    blocks: ObjectRef {
+                        digest: Hash32([12; 32]),
+                        length: 1,
+                    },
+                    data: [ObjectRef::default(); DATA_PARTITIONS],
+                    indexes: [ObjectRef::default(); ROUTER_PARTITIONS],
+                }],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        far.commit.published_number = 5_001_000;
+        far.commit.active_window_start = 5_000_001;
+        far.commit.active_directory = rolled_directory;
+        assert_eq!(
+            far.account_at(Address([6; 20]), 5_001_000)
+                .await
+                .unwrap()
+                .unwrap()
+                .balance[31],
+            2
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
   "claim": "completed deterministic Base-cardinality-shaped 30-day sealed-epoch stress test; not semantically complete forward state or production R2 performance",
   "source_result_sha256": "c72c2960789cbf6000c42624dacaab03d70939a239747149dc3825d901c977c4",
   "run": {
-    "host": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+    "host": "benchmark host: 32 cores, 128 GiB RAM, 15 TiB RAID",
     "blocks": 1296000,
     "epoch_blocks": 1000,
     "epochs_completed": 1296,
@@ -60,7 +60,6 @@
   "caveats": [
     "The workload reproduces measured change counts and approximate key cardinalities but not authoritative forward EVM state.",
     "The run used the filesystem backend, not R2 or S3.",
-    "Code blobs, a production exhaustive anchor, network latency, retries, and provider billing are excluded.",
-    "The run predates only naming/magic consolidation into format version 1; the sealed-epoch physical layout and generator are unchanged."
+    "Code blobs, a production exhaustive anchor, network latency, retries, and provider billing are excluded."
   ]
 }

@@ -11,7 +11,9 @@ content-addressed objects, and head-last atomic publication. There is one archiv
 format and one CLI path.
 
 Start with the illustrated [architecture and storage walkthrough](docs/architecture.md).
-Try the public, read-only [live Base R2/Cloudflare Worker demo](docs/live-demo.md).
+Try the canonical, read-only [live Base genesis demo](docs/live-demo.md) through the
+Rust/WASM Cloudflare Worker; its endpoint remains anonymized as `$FOSSIL_RPC` in the
+repository.
 Runtime choices for the native server and the bounded Rust/WASM Cloudflare archive
 reader are described in [deployment](docs/deployment.md). Worker setup and scope are
 in [`worker/README.md`](worker/README.md). See also [format](docs/format.md),
@@ -72,17 +74,15 @@ storage return Ethereum zero values.
 
 ## Benchmarks
 
-The live Rust/WASM Worker demo now exposes an exact sparse overlay across Base blocks
-`51,232,601..51,535,000` (302,400 blocks/303 epochs). The 81,245,782-byte query
-archive built in 294.920 seconds and uploaded to R2 in 71 seconds. A separate
-4,427,761,942-byte real-week physical-layout corpus is retained as layout evidence,
-not queryable forward state. After both uploads, the bucket remained below its 5 GB
-cap at 4,514,343,105 bytes. Results, environment-specific query medians, and scope
-caveats are in
-[`benchmarks/results/live-week-demo.json`](benchmarks/results/live-week-demo.json)
-and the [copy-paste live guide](docs/live-demo.md). This sparse overlay is exact only
-for its documented vault, WETH-contract native ETH balance, and pool reserve keys; it
-is not arbitrary-address-complete.
+The canonical live deployment is an exhaustive Base genesis archive, not a sparse
+overlay. Its block-0 package contains 2,064 accounts, 2,075 nonzero storage slots, and
+16 unique code blobs. The 1,181,558-byte source package produced local archive commit
+`0x03bb43f7841f56460e8214d2e8900b97cb26ae802fa9d529ea52f7af645e7470`; the live
+`v1/` R2 prefix currently contains 485 objects totaling 230,581 bytes. Its complete
+usable state range is block `0..0`. See the
+[`live-genesis-demo.json`](benchmarks/results/live-genesis-demo.json) artifact and the
+[copy-paste verification guide](docs/live-demo.md). This inventory is point-in-time
+deployment evidence, not an SLA.
 
 The checked 1,000-block artifact is
 [`benchmarks/results/base-shaped-epoch.json`](benchmarks/results/base-shaped-epoch.json):
@@ -97,9 +97,10 @@ The completed Base-cardinality-shaped 100,000-block run sealed 100 epochs in
 bytes**. Its compact result is
 [`benchmarks/results/base-shaped-epoch-100k.json`](benchmarks/results/base-shaped-epoch-100k.json).
 This is synthetic cardinality-shaped filesystem evidence, not authoritative forward
-EVM state or production R2 performance. It is a retained historical run that predates
-the new month-universe storage-address mapping, not a claimed result from the current
-generator without rerunning 100k. The full progress result has SHA-256
+EVM state or production R2 performance. Its generator does not include the
+month-universe storage-address mapping used by the current generator, so a rerun is
+required before claiming current-generator performance. The full progress result has
+SHA-256
 `a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4`.
 
 Real read-only `StaticFileProvider` measurement now covers Base blocks
@@ -146,11 +147,13 @@ collection are future work.
 
 The native Tokio/Axum binary is the full JSON-RPC server. The Rust/WASM Cloudflare
 Worker is a bounded catalog/checkpoint reader and read-only object gateway, not a
-second archive. A sparse public [live demo](docs/live-demo.md) serves standard balance,
-nonce, code, storage, chain ID, block-number, and client-version methods directly from
-R2. Its week overlay is exact for the explicitly tracked keys, including the native ETH
-balance held by the WETH contract, but is not arbitrary-address-complete. Logs and
-historical EVM execution are not implemented.
+second archive. The canonical [live genesis deployment](docs/live-demo.md) serves
+standard balance, nonce, code, storage, chain ID, block-number, and client-version
+methods directly from bucket `fossil` under archive root `v1/`. It is exhaustive for
+Base block 0, and its current complete usable state range is exactly block `0..0`.
+Forward-only append requires contiguous authoritative post-state deltas or replay; the
+current data source lacks changesets before block 50,000,000, so no later complete
+state is claimed yet. Logs and historical EVM execution are not implemented.
 
 Input remains canonical `fossil-export/1`. The exporter/finality source is trusted.
 Fossil validates continuity, references, bounds, and content integrity, but SHA-256

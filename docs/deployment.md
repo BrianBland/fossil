@@ -47,11 +47,16 @@ ID, and block-number reads, plus the standard client version method. It also ret
 a read-only streaming gateway restricted to canonical
 `/objects/objects/sha256/<shard>/<digest>` CAS keys, with byte ranges and ETags. Mutable
 heads are reachable only by RPC internals. There are no list or write operations and no
-custom `fossil_*` RPC methods. A public, read-only deployment serves an exact sparse
-overlay for documented keys across Base blocks `51,232,601..51,535,000`; it is not
-arbitrary-address-complete. Exact verification commands, publication timing, the
-below-5-GB bucket inventory, and environment-specific (non-SLA) latency medians are
-documented in the [live Base R2/Cloudflare Worker demo](live-demo.md).
+custom `fossil_*` RPC methods.
+
+The canonical live deployment binds bucket `fossil` and archive root prefix `v1/`.
+It serves an exhaustive format-v1 Base genesis anchor with a complete usable state
+range of block `0..0`; the repository uses the anonymized `$FOSSIL_RPC` placeholder
+rather than publishing its Worker hostname. The checked
+[live demo](live-demo.md) records exact `cast` checks and the current R2 inventory.
+Forward-only append requires contiguous authoritative post-state deltas or replay. The
+current data source lacks changesets before block 50,000,000, so it cannot connect the
+genesis anchor to later available history and no later complete state is claimed.
 
 The edge implementation supports bounded completed-window catalog selection and exact
 checkpoint fallback as well as the active window. Worker-specific object caps remain
@@ -68,8 +73,14 @@ one format-v1 archive + shared golden object graph
 Worker limits vary by plan and release. The implementation enforces a 16 KiB RPC body,
 192 R2 GETs, 128 MiB aggregate fetched and decoded, an 8 MiB decoded/8.25 MiB encoded
 Worker data-object cap, a 2 MiB encoded index cap with bounded filtered candidates,
-pre-I/O ObjectRef budget reservation, and an 8 MiB per-request object cache. The native
-format retains its separate 64 MiB data-object allowance.
+pre-I/O ObjectRef budget reservation, newest-first index fetch waves of at most 12, and
+a 96-object/16 MiB per-request immutable cache with a 2 MiB item cap. The current
+worker-rs/WASM deployment deliberately omits mutable module-static caching because its
+cross-request synchronization/lifetime safety is not guaranteed. Format-v1 publishers
+share the Worker's 8 MiB decoded/8.25 MiB encoded data-object and 2 MiB encoded index
+caps, so native publication cannot produce an isolate-unreadable archive. The native
+server processes JSON-RPC batch entries with at most eight concurrent futures against
+one publication snapshot while preserving response order.
 These are safety ceilings, not proof that a worst-case lookup fits a particular
 Cloudflare CPU/subrequest plan; production deployment must measure
 real archive paths and may need lower method-specific limits. See the Worker README

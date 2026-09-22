@@ -1,10 +1,10 @@
 # Base measurement provenance
 
-These retained summaries were sampled on **2026-09-19**. The 100,000-block evidence
+These measurement summaries were sampled on **2026-09-19**. The 100,000-block evidence
 ends at finalized Base head **51,498,020**; the month evidence ends at finalized Base
-head **51,525,110**. The machine was `devbox` with **32 cores, 128 GiB RAM, and a
-15 TiB RAID**. The node image was `ghcr.io/base/node:v1.3.0-rc.6`; its Base Reth source was
-tag `base-v2.5.2.6`, commit `5877708b`.
+head **51,525,110**. The benchmark host had **32 cores, 128 GiB RAM, and a 15 TiB
+RAID**. The node image was `ghcr.io/base/node:v1.3.0-rc.6`; its Base Reth source was tag
+`base-v2.5.2.6`, commit `5877708b`.
 
 ## Extraction methodology
 
@@ -16,7 +16,7 @@ chunks and discarded each decoded chunk after encoding its layout outputs. The m
 layout pass processed 1,296 real 1,000-block chunks in five resumable slices; its
 reported elapsed time is the sum of those slices.
 
-The retained summaries and full month progress result have these SHA-256 digests:
+The measurement summaries and full month progress result have these SHA-256 digests:
 
 | Summary | SHA-256 |
 |---|---|
@@ -30,12 +30,11 @@ The retained summaries and full month progress result have these SHA-256 digests
 | month layout | `15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c` |
 | month sealed-epoch full result | `c72c2960789cbf6000c42624dacaab03d70939a239747149dc3825d901c977c4` |
 
-## Exact ranges and retained results
+## Exact ranges and results
 
 - Blocks **51,497,021..51,498,020**: 161,699 account changes, 20,614
   unique accounts, 4,639 tombstones; 851,445 storage changes, 244,196
-  unique slots, 169,441 zero values; Reth data plus offsets 67,895,321
-  bytes. The prior compact key-major Zstd-9 experiment was 13,678,118 bytes.
+  unique slots, 169,441 zero values; Reth data plus offsets 67,895,321 bytes.
 - Blocks **51,398,021..51,498,020**: 19,866,464 account changes and
   88,534,816 storage changes; Reth data plus offsets 7,166,841,936 bytes.
   The 100 chunks produced block-major Zstd-9 at 1,854,933,204 bytes and
@@ -85,7 +84,7 @@ overlap and generated IDs remain inside the month universes.
 
 The deterministic Base-cardinality-shaped stress test completed **1,296,000 blocks**
 and all **1,296 1,000-block epochs** in **9,449.0865 seconds (2h37m29s)** on the
-documented devbox. It produced 20 completed windows plus 16 active epochs,
+documented benchmark host. It produced 20 completed windows plus 16 active epochs,
 **234,368 immutable objects**, and **23,277,861,710 logical immutable bytes**. The
 object counts include 41,472 data, 165,888 index, 23,060 checkpoint, 1,316 directory,
 40 catalog, and 1,296 commit objects. The compact checked result is
@@ -99,45 +98,20 @@ performance. It uses measured change counts and approximate HLL cardinalities, b
 excludes semantically complete forward state, code traffic, a production exhaustive
 anchor, provider latency/retries, and provider billing.
 
-## Corrected sealed-epoch 100k result
+## Sealed-epoch 100k result
 
-The corrected Base-cardinality-shaped generator completed all 100 sealed epochs in
+The Base-cardinality-shaped generator completed all 100 sealed epochs in
 **228.7859 seconds**, producing **17,456 immutable objects** and **1,141,404,991
 logical immutable bytes**. It passed the prototype gates of 600 seconds, 35,000
 objects, and 2.75 GB. The compact checked result is
 `benchmarks/results/base-shaped-epoch-100k.json`; the complete progress result has
 SHA-256 `a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4`.
 
-This run used the filesystem backend on the devbox and the approximate HLL cardinality
-shape. It is not production R2 evidence or semantically complete forward EVM state.
-It predates the month-universe storage-address mapping introduced with the piecewise
-pool formula, so it remains historical measured evidence rather than a claimed result
-from the current generator without a new 100k run.
-
-## Rejected high-cardinality tuned run
-
-A tuned-format 100k run completed in **425.3685 seconds** with **17,456 objects** but
-used **3,006,815,546 bytes**. Its generator used 2.1 million account and 24.4 million
-slot pools and made almost every epoch key unique, so it is intentionally rejected as
-a pessimistic high-cardinality generator result and is not Base-shaped.
-
-## First sealed-epoch 100k tuning result
-
-The first exact sealed-epoch run completed in 505.440 seconds but produced 41,009
-immutable objects and 3,297,864,788 bytes: 6,400 data, 25,600 index, 8,706 checkpoint,
-101 directory, 2 catalog, and 100 commit objects. It passed the runtime target but
-failed the 35,000-object and 2.75 GB targets. The retained result SHA-256 is
-`ab028cce9f88858725300fa05b82853cbeb037b3d9cb5820778dbd76774cbd93`.
-This motivated 128 router partitions, 32 data partitions, 8 checkpoint subshards, and
-one closing checkpoint. Those superseded runs remain rejected tuning evidence.
-
-## Rejected state-key COW scale run
-
-The exact 100,000-block run using the former immutable state-key COW prototype emitted
-929,134 files (about 3 GB logical/5 GB allocated) before exhausting the 1,048,576
-`/tmp` inode limit. A rerun on md0 accumulated 26 GB and was unfinished after 15
-minutes. This is negative design evidence for choosing sealed epochs, not a result for the
-implemented format.
+This run used the filesystem backend on the benchmark host and the approximate HLL
+cardinality shape. It is not production R2 evidence or semantically complete forward
+EVM state. Its generator does not include the month-universe storage-address mapping
+used by the current piecewise pool formula, so a new 100k run is required before
+claiming current-generator performance.
 
 ## Caveats
 

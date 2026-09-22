@@ -10,12 +10,15 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+const BATCH_CONCURRENCY: usize = 8;
 
 #[async_trait]
 pub trait RpcBackend: Send + Sync {
@@ -245,10 +248,11 @@ async fn handle_rpc_backend(
         if requests.is_empty() || requests.len() > batch_limit {
             return error(Value::Null, -32600, "invalid batch size");
         }
-        let mut responses = Vec::with_capacity(requests.len());
-        for value in requests {
-            responses.push(handle_value(publication, value).await);
-        }
+        let responses = stream::iter(requests)
+            .map(|value| handle_value(publication, value))
+            .buffered(BATCH_CONCURRENCY)
+            .collect()
+            .await;
         Value::Array(responses)
     } else {
         handle_value(publication, value).await
@@ -455,6 +459,74 @@ mod tests {
     use crate::archive::PublicationGate;
     use crate::normalized::read_package;
     use crate::store::{ArchiveStore, MemoryArchiveStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ConcurrentBackend {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl ConcurrentBackend {
+        fn new() -> Self {
+            Self {
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            }
+        }
+
+        async fn enter(&self) {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl RpcBackend for ConcurrentBackend {
+        fn chain_id(&self) -> u64 {
+            1
+        }
+        fn generation(&self) -> u64 {
+            1
+        }
+        fn anchor_number(&self) -> u64 {
+            0
+        }
+        fn published_number(&self) -> u64 {
+            0
+        }
+        fn publication_digest(&self) -> Hash32 {
+            Hash32([1; 32])
+        }
+        fn finalized(&self) -> bool {
+            true
+        }
+        fn supports_block_hash_selector(&self) -> bool {
+            false
+        }
+        fn metrics(&self) -> String {
+            String::new()
+        }
+        async fn account_at(&self, _address: Address, _block: u64) -> Result<Option<AccountEvent>> {
+            self.enter().await;
+            Ok(None)
+        }
+        async fn storage_at(
+            &self,
+            _address: Address,
+            _slot: Hash32,
+            _block: u64,
+        ) -> Result<[u8; 32]> {
+            unreachable!()
+        }
+        async fn code_at(&self, _address: Address, _block: u64) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn block_number_by_hash(&self, _hash: Hash32) -> Result<Option<u64>> {
+            unreachable!()
+        }
+    }
 
     fn package(mode: &str, block: u8) -> Vec<u8> {
         let hash = Hash32([block + 1; 32]);
@@ -474,6 +546,30 @@ mod tests {
             "{header}\n{{\"type\":\"block\",\"number\":\"0x{block:x}\",\"hash\":\"{hash}\",\"parent_hash\":\"{parent}\",\"state_root\":\"{}\",\"timestamp\":\"0x{block:x}\"}}\n{{\"type\":\"block_end\",\"number\":\"0x{block:x}\",\"event_count\":\"0x0\"}}\n{{\"type\":\"trailer\",\"end_number\":\"0x{block:x}\",\"end_hash\":\"{hash}\",\"block_count\":\"0x1\"}}\n",
             Hash32([100 + block; 32])
         ).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn batch_runs_at_most_eight_entries_concurrently_and_preserves_order() {
+        let backend = ConcurrentBackend::new();
+        let requests = (0..12)
+            .map(|id| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "eth_getBalance",
+                    "params": ["0x0000000000000000000000000000000000000001", "latest"]
+                })
+            })
+            .collect();
+        let response = handle_rpc_backend(&backend, Value::Array(requests), 100).await;
+        let ids: Vec<_> = response
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, (0..12).collect::<Vec<_>>());
+        assert_eq!(backend.max_in_flight.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ hot/pruned node -> exporter/sealer -> one R2/S3-compatible object store
 
 There is no DHT, peer routing, or federation. Scale comes from many stateless readers
 sharing one backend and bounded caches. The Rust/WASM Worker reads the standard
-publication head and immutable objects below `fossil-demo/`, serves the bounded
+publication head and immutable objects below `v1/`, serves the bounded
 balance/nonce/code/storage JSON-RPC subset across active and completed windows (including
 catalog selection and checkpoint fallback), and retains a read-only gateway restricted
 to canonical immutable SHA-256 CAS keys. Log serving is not implemented. See [deployment](deployment.md) for runtime details.
@@ -44,7 +44,7 @@ flowchart TD
     H[mutable finalized.bin head] --> C[immutable fixed-size commit]
     C --> D[active window directory]
     D --> CP[base checkpoint from preceding completed window]
-    CP --> CPS[128 routed checkpoint partitions, subsharded as needed]
+    CP --> CPS[128 routed checkpoint partitions, adaptive 8 to 256 subshards each]
     D --> E[sealed epoch descriptor: up to 1,000 blocks]
     E --> B[block metadata object]
     E --> DP[up to 32 data objects]

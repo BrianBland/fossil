@@ -573,7 +573,7 @@ fn manual_result(
         "catalog_objects": stats.catalog_objects,
         "commit_objects": stats.commit_objects,
         "elapsed_seconds": elapsed,
-        "corrected_generator_pools": {
+        "generator_pools": {
             "local_accounts_per_1000_blocks": LOCAL_ACCOUNT_POOL,
             "local_storage_keys_per_1000_blocks": LOCAL_STORAGE_POOL,
             "expected_accounts_across_100_epochs": expected_union_pool(LOCAL_ACCOUNT_POOL, HUNDRED_K_ACCOUNT_POOL, MONTH_ACCOUNT_POOL, HUNDRED_K_EPOCHS),
@@ -581,12 +581,17 @@ fn manual_result(
             "expected_accounts_across_1296_epochs": expected_union_pool(LOCAL_ACCOUNT_POOL, HUNDRED_K_ACCOUNT_POOL, MONTH_ACCOUNT_POOL, MONTH_EPOCHS),
             "expected_storage_keys_across_1296_epochs": expected_union_pool(LOCAL_STORAGE_POOL, HUNDRED_K_STORAGE_POOL, MONTH_STORAGE_POOL, MONTH_EPOCHS)
         },
-        "tuned_format_fanout": {
+        "format_fanout": {
             "router_partitions": 128,
             "data_partitions": 32,
-            "checkpoint_subshards_per_partition": 8,
-            "expected_100k_max_objects_excluding_code": 17456,
-            "note": "structural worst-case object fanout for 100 epochs and one closing checkpoint; bytes and runtime require rerun"
+            "checkpoint_subshards_per_partition": {
+                "minimum": 8,
+                "maximum": 256,
+                "selection": "smallest power of two keeping every decoded shard body at or below 32 MiB"
+            },
+            "projected_100k_objects_at_minimum_checkpoint_fanout_excluding_code": 17456,
+            "structural_100k_max_objects_at_256_checkpoint_subshards_excluding_code": 49100,
+            "note": "100 epochs produce one closing checkpoint; Base-shaped measurements fit the minimum fanout, while the adaptive maximum is a capacity ceiling rather than a projection"
         },
         "acceptance_targets": {
             "objects_excluding_code_max": 35000,
@@ -766,7 +771,7 @@ fn provenance() -> Value {
         "sampled_at": "2026-09-19",
         "hundred_k_finalized_head": 51498020,
         "month_finalized_head": 51525110,
-        "hardware": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+        "hardware": "benchmark host: 32 cores, 128 GiB RAM, 15 TiB RAID",
         "node_image": "ghcr.io/base/node:v1.3.0-rc.6",
         "base_reth_tag": "base-v2.5.2.6",
         "base_reth_commit": "5877708b",
@@ -815,34 +820,6 @@ fn provenance() -> Value {
             "key_major_percent_smaller_than_block_major": 18.1665,
             "summary_sha256": "15fb23b5244a74c3896cfc2cf6aa51a06e1470d0f28b11daf286981cbea2434c",
             "caveat": "layout-only processing of real changesets; not an end-to-end sealed-epoch archive run"
-        },
-        "rejected_tuned_high_cardinality_generator_run": {
-            "elapsed_seconds": 425.3685,
-            "immutable_objects": 17456,
-            "immutable_bytes": 3006815546_u64,
-            "result": "completed tuned format run with intentionally rejected over-cardinal synthetic pools; not Base-shaped"
-        },
-        "rejected_first_sealed_epoch_scale_run": {
-            "elapsed_seconds": 505.440,
-            "immutable_objects": 41009,
-            "immutable_bytes": 3297864788_u64,
-            "data_objects": 6400,
-            "index_objects": 25600,
-            "checkpoint_objects": 8706,
-            "directory_objects": 101,
-            "catalog_objects": 2,
-            "commit_objects": 100,
-            "summary_sha256": "ab028cce9f88858725300fa05b82853cbeb037b3d9cb5820778dbd76774cbd93",
-            "result": "runtime passed; object and byte targets failed; input to partition/subshard tuning"
-        },
-        "rejected_cow_run": {
-            "tmp_objects_before_inode_exhaustion": 929134,
-            "tmp_logical_bytes_approx": 3_000_000_000_u64,
-            "tmp_allocated_bytes_approx": 5_000_000_000_u64,
-            "tmp_inode_limit": 1048576,
-            "md0_bytes_when_stopped": 26_000_000_000_u64,
-            "md0_elapsed_when_stopped_seconds": 900,
-            "result": "rejected immutable state-key COW design; unfinished"
         },
         "caveat": "external real measurements are layout evidence, not semantically complete forward state or end-to-end epoch publication"
     })

@@ -14,7 +14,7 @@
 - The checked 1,000-block workload is synthetic changeset-shape evidence. The external
   real 100,000-block result is codec/layout evidence, not end-to-end epoch publication
   or forward-state validation.
-- The corrected Base-cardinality-shaped 100,000-block run passed its prototype gates
+- The Base-cardinality-shaped 100,000-block run passed its prototype gates
   in 228.786 seconds with 17,456 objects and 1,141,404,991 bytes. It remains synthetic
   physical-layout/publication evidence: it does not contain authoritative forward state,
   a production exhaustive anchor, code traffic, provider latency/retries, or R2 billing.
@@ -33,6 +33,11 @@
   chain/genesis/anchor identity matches and number/generation advance. Lazy object
   corruption is discovered on access. `verify` checks head/commit only; no
   full-history audit exists.
+- Format-v1 publication hard-fails if a fixed epoch data partition exceeds the shared
+  Worker cap of 8 MiB decoded/8.25 MiB encoded or an index exceeds 2 MiB encoded.
+  Checkpoints adapt from 8 through 256 subshards per primary partition and hard-fail if
+  any emitted decoded shard body still exceeds 32 MiB. This favors readable archives
+  over accepting an oversized epoch; adaptive epoch-data splitting is not implemented.
 - Code CAS objects have a 1 MiB prototype hard limit; chains requiring a larger
   contract-code policy need a format revision and new resource measurements.
 - Fossil EIP-1898 block-hash selectors are rejected until a durable bounded hash-to-number
@@ -44,18 +49,17 @@
   rollback tool, or disaster-recovery tool is included. Superseded active directories,
   commits, and orphans require future offline GC after a rollback window.
 - Memory/filesystem and generic conditional object-store behavior are tested locally.
-  The live week demo adds one real R2 publication and sequential read-latency
-  observation, but broader R2 conditional-write/load testing and AWS S3 and MinIO
-  conditional-write/latency tests remain required. Its Seattle/Mac latency medians are
-  environment-specific observations, not an SLA; raw samples and first/max timing were
-  not retained.
-- The public, read-only Rust/WASM Cloudflare Worker implements bounded active and
-  completed-window balance, nonce, code, and storage lookups, including two-level catalog
-  selection and checkpoint fallback, plus chain ID, block number, client version, and an
-  immutable-object gateway under `fossil-demo/`. Its live 302,400-block query archive is
-  an exact sparse overlay only for the documented Sequencer Fee Vault native balance,
-  WETH contract native ETH balance, and Aerodrome reserve keys. It is not
-  arbitrary-address-complete; the separate `fossil-week-layout` corpus is physical-layout
-  evidence and not directly queryable forward state. The Worker does not implement logs,
-  calls, tracing, writes, deletes, or listing. The native Tokio/Axum adapter remains the
-  full JSON-RPC server. See the [live demo](live-demo.md).
+  The live genesis deployment demonstrates one real R2 publication and standard RPC
+  reads, but it is not broader R2 conditional-write/load testing, an availability or
+  latency SLA, or AWS S3/MinIO validation. The checked inventory is a point-in-time
+  observation.
+- The Rust/WASM Cloudflare Worker implements bounded active and completed-window
+  balance, nonce, code, and storage lookups, including two-level catalog selection and
+  checkpoint fallback, plus chain ID, block number, client version, and an
+  immutable-object gateway. The canonical configuration uses bucket `fossil` and
+  archive root `v1/`. Its Base block-0 anchor is exhaustive, but the current complete
+  usable state range is only block `0..0`. Forward-only append requires contiguous
+  authoritative post-state deltas or replay; the current source lacks changesets
+  before block 50,000,000, so no later complete state is claimed. The Worker does not
+  implement logs, calls, tracing, writes, deletes, or listing. The native Tokio/Axum
+  adapter remains the full JSON-RPC server. See the [live genesis demo](live-demo.md).

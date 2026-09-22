@@ -4,10 +4,11 @@ This is the initial Fossil on-disk format. Every binary object carries schema ve
 1. There is one mutable head, `chains/<chain-id>/heads/finalized.bin`, and one
 immutable object namespace. Readers do not probe alternate keys or formats.
 
-The fixed layout uses 128 router/checkpoint partitions, 32 epoch data partitions,
-eight checkpoint subshards per primary partition, epochs of at most 1,000 blocks, and
-windows of 64 sealed epoch descriptors. The immutable references make this object
-hierarchy a [Merkle DAG rooted at the commit digest](integrity.md).
+The layout uses 128 router/checkpoint partitions, 32 epoch data partitions, adaptive
+power-of-two checkpoint subsharding (8 through 256 subshards per primary partition),
+epochs of at most 1,000 blocks, and windows of 64 sealed epoch descriptors. The
+immutable references make this object hierarchy a
+[Merkle DAG rooted at the commit digest](integrity.md).
 
 ## Head and commit
 
@@ -69,15 +70,23 @@ After the 64th descriptor, publication builds exactly one closing checkpoint:
 2. builds each of 128 primary checkpoint partitions independently, never one global
    state map;
 3. filters storage pointers using the account's final existence/incarnation;
-4. shards each primary partition into 8 full-key-hash subshards and emits a small
-   partition manifest plus global checkpoint manifest;
+4. shards each primary partition into at least 8 full-key-hash subshards, doubling to
+   16/32/.../256 until every decoded shard body is within the writer target, and emits
+   a count-bearing partition manifest plus global checkpoint manifest;
 5. appends the completed window to a numeric catalog chunk; and
 6. starts a new empty active directory based on that checkpoint.
 
-Each checkpoint subshard targets at most 32 MiB decoded and hard-fails above 64 MiB.
-The global checkpoint manifest commits the boundary block. A checkpoint pointer is
-accepted only when its version is at or before that boundary and the next version is
-absent or after it. Manifest boundaries must match the directory base/tail boundary.
+The writer hard-fails rather than emitting any checkpoint subshard body above 32 MiB
+decoded. If a shard remains oversized at 256-way subsharding, publication fails with an
+explicit capacity error. The partition manifest count must be a power of two in
+`8..=256`; readers derive its index from the corresponding additional full-key SHA-256
+bits. Format-v1 readers accept two `FSPS` encodings: the exact 293-byte fixed-eight
+form (`magic || version || 8 ObjectRef`s), where the count is implicitly 8, and the
+count-bearing adaptive form (`magic || version || u16 count || count ObjectRef`s). The
+writer emits only the count-bearing adaptive form; accepting the fixed-eight form is
+backward-compatible decoding. The global checkpoint manifest commits the boundary
+block. A checkpoint pointer is accepted only when its version is at or before that
+boundary and the next version is absent or after it. Manifest boundaries must match the directory base/tail boundary.
 A query fetches one global manifest, one partition manifest, one subshard, and its
 pointed data object. The completed-window catalog is two-level: a bounded root of at
 most 4,096 chunk references and chunks of at most 256 numerically sorted windows.
@@ -105,12 +114,15 @@ epoch block objects.
 
 Readers may lazily cache verified directory, index, checkpoint, and data objects. This
 cache is bounded, disposable, and never authoritative; readiness does not ingest
-history. One logical RPC lookup has hard internal limits of 192 remote object GETs and
-128 MiB total decoded bytes. Native data/checkpoint objects have 64 MiB hard decoded
-limits; the isolate-constrained Rust/WASM Worker applies stricter 8 MiB decoded/8.25
-MiB encoded data-object and 2 MiB encoded index limits without changing the format.
-Checkpoint subshards have a 32 MiB construction target. Limit exhaustion fails closed.
-Process-wide concurrency remains an operator limit.
+history. Checkpoint construction also bounds its per-primary-partition decoded-data
+cache to two objects/16 MiB and releases it before the next partition. One logical RPC
+lookup has hard internal limits of 192 remote object GETs and 128 MiB total decoded
+bytes. Format-v1 publication caps data objects at 8 MiB decoded/8.25 MiB encoded and
+index objects at 2 MiB encoded so every native publication remains Worker-readable.
+The checkpoint writer cap is 32 MiB decoded per emitted shard; a native reader may use
+a different defensive decode ceiling, but that does not permit a writer to exceed
+32 MiB. Limit exhaustion fails closed. Process-wide concurrency remains an operator
+limit.
 
 ## Publication and retention
 

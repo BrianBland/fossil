@@ -3,7 +3,7 @@
   "claim": "completed deterministic Base-cardinality-shaped sealed-epoch stress test; not semantically complete forward state or production R2 performance",
   "source_result_sha256": "a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4",
   "run": {
-    "host": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+    "host": "benchmark host: 32 cores, 128 GiB RAM, 15 TiB RAID",
     "blocks": 100000,
     "epoch_blocks": 1000,
     "epochs_completed": 100,
@@ -19,7 +19,7 @@
     "unique_storage_keys_across_100_epochs": 17339777,
     "cardinality_source": "read-only StaticFileProvider HyperLogLog estimate over Base blocks 51,398,021..51,498,020",
     "cardinality_summary_sha256": "e00f51a7cc9be49a2560342c20df44f15bc8dd2a53285eab1bb84042f2fccd8a",
-    "generator_note": "historical completed run predating month-universe storage-address mapping; retained measured evidence, not a result from the current generator without rerun"
+    "generator_note": "measured run without the current month-universe storage-address mapping; a rerun is required for current-generator performance claims"
   },
   "result": {
     "immutable_objects": 17456,
@@ -47,7 +47,6 @@
   "caveats": [
     "The workload reproduces measured change counts and approximate key cardinalities but not authoritative forward EVM state.",
     "The run used the filesystem backend, not R2 or S3.",
-    "Code blobs, a production exhaustive anchor, network latency, retries, and provider billing are excluded.",
-    "Subsequent bounded-read integrity changes did not alter the epoch physical layout or benchmark generator."
+    "Code blobs, a production exhaustive anchor, network latency, retries, and provider billing are excluded."
   ]
 }

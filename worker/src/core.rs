@@ -1,10 +1,12 @@
 //! Platform-neutral, bounded Fossil format-v1 reader used by the Worker and native tests.
 
+use futures_util::future::join_all;
 use ruzstd::decoding::StreamingDecoder;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor as IoCursor, Read};
+use std::sync::Arc;
 
 const VERSION: u8 = 1;
 const HEAD_BYTES: usize = 97;
@@ -13,30 +15,35 @@ const REF_BYTES: usize = 36;
 const ROUTER_PARTITIONS: usize = 128;
 const DATA_PARTITIONS: usize = 32;
 const EPOCHS_PER_WINDOW: usize = 64;
-const CHECKPOINT_SUBSHARDS: usize = 8;
+const MIN_CHECKPOINT_SUBSHARDS: usize = 8;
+const MAX_CHECKPOINT_SUBSHARDS: usize = 256;
 const MAX_EPOCH_BLOCKS: u64 = 1_000;
 const MAX_DIRECTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const CATALOG_CHUNK_ENTRIES: usize = 256;
 const MAX_CATALOG_CHUNKS: usize = 4_096;
 const CHECKPOINT_MANIFEST_BYTES: usize = 4 + 1 + 8 + ROUTER_PARTITIONS * REF_BYTES;
-const CHECKPOINT_PARTITION_MANIFEST_BYTES: usize = 4 + 1 + CHECKPOINT_SUBSHARDS * REF_BYTES;
-// Worker checkpoint shards are deliberately tighter than native's 64 MiB allowance.
+const LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES: usize =
+    4 + 1 + MIN_CHECKPOINT_SUBSHARDS * REF_BYTES;
+const MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES: usize =
+    4 + 1 + 2 + MAX_CHECKPOINT_SUBSHARDS * REF_BYTES;
+// The writer hard-fails above 32 MiB decoded; this matching reader cap bounds isolates.
 pub const MAX_CHECKPOINT_DECODED: usize = 32 * 1024 * 1024;
 pub const MAX_CHECKPOINT_OBJECT_BYTES: usize = MAX_CHECKPOINT_DECODED + 1024 * 1024;
-// Worker-specific cap; measured demo/real index deltas are far below this bound.
+// Shared format publication cap; measured demo/real index deltas are far below it.
 pub const MAX_INDEX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_ENTRIES: usize = 65_536;
 const MAX_INDEX_CANDIDATES: usize = 64;
-// Worker-specific isolate bound. Native Fossil keeps its independent 64 MiB format cap.
+// Shared format publication cap chosen for isolate-safe decoding.
 pub const MAX_DATA_DECODED: usize = 8 * 1024 * 1024;
 pub const MAX_DATA_OBJECT_BYTES: usize = MAX_DATA_DECODED + 256 * 1024;
 const MAX_CODE_OBJECT_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_GETS: u64 = 192;
 const MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
-const CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
-const CACHE_MAX_ITEMS: usize = 32;
+const INDEX_FETCH_CONCURRENCY: usize = 12;
+const CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_MAX_ITEMS: usize = 96;
 const CACHE_MAX_ITEM_BYTES: usize = 2 * 1024 * 1024;
 const EMPTY_CODE_HASH: [u8; 32] =
     hex_literal("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
@@ -151,7 +158,6 @@ struct CatalogRoot {
 #[derive(Clone, Copy, Debug)]
 struct Route {
     partition: u8,
-    subshard: u8,
     fingerprint: [u8; 12],
 }
 #[derive(Clone, Copy, Debug)]
@@ -178,6 +184,16 @@ pub struct Account {
     code_hash: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequestStats {
+    pub immutable_gets: u64,
+    pub fetched_bytes: u64,
+    pub decoded_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_evictions: u64,
+}
+
 #[derive(Default)]
 struct Budget {
     gets: u64,
@@ -186,14 +202,26 @@ struct Budget {
 }
 impl Budget {
     fn reserve_fetch(&mut self, length: usize) -> Result<()> {
-        let fetched = self
-            .fetched
-            .checked_add(length as u64)
-            .ok_or(ArchiveError::Limit)?;
-        if self.gets >= MAX_REMOTE_GETS || fetched > MAX_REQUEST_BYTES {
+        self.reserve_fetches(std::iter::once(length))
+    }
+    fn reserve_fetches(&mut self, lengths: impl IntoIterator<Item = usize>) -> Result<()> {
+        let (count, bytes) =
+            lengths
+                .into_iter()
+                .try_fold((0u64, 0u64), |(count, bytes), length| -> Result<_> {
+                    Ok((
+                        count.checked_add(1).ok_or(ArchiveError::Limit)?,
+                        bytes
+                            .checked_add(length as u64)
+                            .ok_or(ArchiveError::Limit)?,
+                    ))
+                })?;
+        let gets = self.gets.checked_add(count).ok_or(ArchiveError::Limit)?;
+        let fetched = self.fetched.checked_add(bytes).ok_or(ArchiveError::Limit)?;
+        if gets > MAX_REMOTE_GETS || fetched > MAX_REQUEST_BYTES {
             return Err(ArchiveError::Limit);
         }
-        self.gets += 1;
+        self.gets = gets;
         self.fetched = fetched;
         Ok(())
     }
@@ -215,9 +243,12 @@ pub struct Reader<'a, S: ObjectStore> {
     pub commit: Commit,
     budget: Budget,
     directory: Option<(u64, u64, Directory)>,
-    cache: HashMap<String, Vec<u8>>,
+    cache: HashMap<String, Arc<Vec<u8>>>,
     cache_order: VecDeque<String>,
     cache_bytes: usize,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_evictions: u64,
 }
 
 impl<'a, S: ObjectStore> Reader<'a, S> {
@@ -253,7 +284,21 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_bytes: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
         })
+    }
+
+    pub fn stats(&self) -> RequestStats {
+        RequestStats {
+            immutable_gets: self.budget.gets.saturating_sub(1),
+            fetched_bytes: self.budget.fetched,
+            decoded_bytes: self.budget.decoded,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+            cache_evictions: self.cache_evictions,
+        }
     }
 
     pub fn resolve_selector(&self, selector: &serde_json::Value) -> Result<u64> {
@@ -316,54 +361,116 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
         Ok(block)
     }
 
-    async fn get_uncached_object(
-        &mut self,
-        reference: ObjectRef,
-        maximum: usize,
-    ) -> Result<Vec<u8>> {
-        get_verified(
-            self.store,
-            &self.prefix,
-            reference,
-            maximum,
-            &mut self.budget,
-        )
-        .await
+    fn cache_key(reference: ObjectRef) -> String {
+        format!("{}:{}", hex::encode(reference.digest), reference.length)
     }
 
-    async fn get_object(&mut self, reference: ObjectRef, maximum: usize) -> Result<Vec<u8>> {
+    fn cached_object(&mut self, reference: ObjectRef) -> Result<Option<Arc<Vec<u8>>>> {
+        let key = Self::cache_key(reference);
+        let Some(bytes) = self.cache.get(&key) else {
+            self.cache_misses += 1;
+            return Ok(None);
+        };
+        if bytes.len() != reference.length as usize
+            || Sha256::digest(bytes.as_slice()).as_slice() != reference.digest
+        {
+            return integrity();
+        }
+        self.cache_hits += 1;
+        Ok(Some(bytes.clone()))
+    }
+
+    fn insert_cache(&mut self, reference: ObjectRef, bytes: Arc<Vec<u8>>) {
+        if bytes.len() > CACHE_MAX_ITEM_BYTES {
+            return;
+        }
+        let cache_key = Self::cache_key(reference);
+        if self.cache.contains_key(&cache_key) {
+            return;
+        }
+        while self.cache.len() >= CACHE_MAX_ITEMS
+            || self.cache_bytes + bytes.len() > CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.cache_order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.cache.remove(&oldest) {
+                self.cache_bytes -= old.len();
+                self.cache_evictions += 1;
+            }
+        }
+        self.cache_bytes += bytes.len();
+        self.cache_order.push_back(cache_key.clone());
+        self.cache.insert(cache_key, bytes);
+    }
+
+    async fn get_object(&mut self, reference: ObjectRef, maximum: usize) -> Result<Arc<Vec<u8>>> {
         validate_ref(reference, false)?;
         if reference.length as usize > maximum {
             return Err(ArchiveError::Limit);
         }
-        let cache_key = format!("{}:{}", hex::encode(reference.digest), reference.length);
-        if let Some(bytes) = self.cache.get(&cache_key) {
-            return Ok(bytes.clone());
+        if let Some(bytes) = self.cached_object(reference)? {
+            return Ok(bytes);
         }
-        let bytes = get_verified(
-            self.store,
-            &self.prefix,
-            reference,
-            maximum,
-            &mut self.budget,
-        )
-        .await?;
-        if bytes.len() <= CACHE_MAX_ITEM_BYTES {
-            while self.cache.len() >= CACHE_MAX_ITEMS
-                || self.cache_bytes + bytes.len() > CACHE_MAX_BYTES
-            {
-                let Some(oldest) = self.cache_order.pop_front() else {
-                    break;
-                };
-                if let Some(old) = self.cache.remove(&oldest) {
-                    self.cache_bytes -= old.len();
-                }
-            }
-            self.cache_bytes += bytes.len();
-            self.cache_order.push_back(cache_key.clone());
-            self.cache.insert(cache_key, bytes.clone());
-        }
+        let bytes = Arc::new(
+            get_verified(
+                self.store,
+                &self.prefix,
+                reference,
+                maximum,
+                &mut self.budget,
+            )
+            .await?,
+        );
+        self.insert_cache(reference, bytes.clone());
         Ok(bytes)
+    }
+
+    async fn get_index_wave(
+        &mut self,
+        references: &[ObjectRef],
+    ) -> Result<Vec<Result<Arc<Vec<u8>>>>> {
+        let mut output = (0..references.len()).map(|_| None).collect::<Vec<_>>();
+        let mut misses = Vec::new();
+        for (position, reference) in references.iter().copied().enumerate() {
+            if let Err(error) = validate_ref(reference, false) {
+                output[position] = Some(Err(error));
+                continue;
+            }
+            if reference.length as usize > MAX_INDEX_BYTES {
+                output[position] = Some(Err(ArchiveError::Limit));
+                continue;
+            }
+            match self.cached_object(reference) {
+                Ok(Some(bytes)) => output[position] = Some(Ok(bytes)),
+                Ok(None) => misses.push((position, reference)),
+                Err(error) => output[position] = Some(Err(error)),
+            }
+        }
+        self.budget.reserve_fetches(
+            misses
+                .iter()
+                .map(|(_, reference)| reference.length as usize),
+        )?;
+        let results = join_all(misses.iter().map(|(_, reference)| {
+            get_verified_reserved(self.store, &self.prefix, *reference, MAX_INDEX_BYTES)
+        }))
+        .await;
+        // Insert oldest-to-newest so FIFO pressure retains the indexes evaluated first.
+        for ((position, reference), result) in misses.into_iter().zip(results).rev() {
+            output[position] = Some(match result {
+                Ok(bytes) => {
+                    let bytes = Arc::new(bytes);
+                    self.insert_cache(reference, bytes.clone());
+                    Ok(bytes)
+                }
+                Err(error) => Err(error),
+            });
+        }
+        output
+            .into_iter()
+            .map(|result| result.ok_or(ArchiveError::Integrity))
+            .collect()
     }
 
     async fn ensure_directory(&mut self, block: u64) -> Result<Directory> {
@@ -428,37 +535,40 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
     async fn lookup_raw(&mut self, key: &[u8], block: u64) -> Result<Option<Version>> {
         let directory = self.ensure_directory(block).await?;
         let route = route_key(key)?;
-        for epoch in directory.epochs.iter().rev() {
-            if epoch.start > block {
-                continue;
-            }
-            let index_ref = epoch.indexes[route.partition as usize];
-            if index_ref.empty() {
-                continue;
-            }
-            if index_ref.length as usize > MAX_INDEX_BYTES {
-                return Err(ArchiveError::Limit);
-            }
-            let bytes = self.get_uncached_object(index_ref, MAX_INDEX_BYTES).await?;
-            self.budget.decoded(bytes.len())?;
-            let index = parse_index_candidates(&bytes, route.fingerprint, block)?;
-            drop(bytes);
-            if index.partition != route.partition || index.epoch_start != epoch.start {
-                return integrity();
-            }
-            for entry in index.candidates {
-                let data_ref = index.dictionary[entry.dictionary_index as usize];
-                if data_ref != epoch.data[route.partition as usize >> 2] {
+        let applicable: Vec<_> = directory
+            .epochs
+            .iter()
+            .rev()
+            .filter(|epoch| epoch.start <= block)
+            .filter_map(|epoch| {
+                let reference = epoch.indexes[route.partition as usize];
+                (!reference.empty()).then_some((epoch, reference))
+            })
+            .collect();
+        for wave in applicable.chunks(INDEX_FETCH_CONCURRENCY) {
+            let references: Vec<_> = wave.iter().map(|(_, reference)| *reference).collect();
+            let indexes = self.get_index_wave(&references).await?;
+            for ((epoch, _), result) in wave.iter().zip(indexes) {
+                let bytes = result?;
+                self.budget.decoded(bytes.len())?;
+                let index = parse_index_candidates(&bytes, route.fingerprint, block)?;
+                if index.partition != route.partition || index.epoch_start != epoch.start {
                     return integrity();
                 }
-                if data_ref.length as usize > MAX_DATA_OBJECT_BYTES {
-                    return Err(ArchiveError::Limit);
-                }
-                let bytes = self.get_object(data_ref, MAX_DATA_OBJECT_BYTES).await?;
-                if let Some(version) =
-                    parse_data_lookup(&bytes, &mut self.budget, entry.run_index, key, block)?
-                {
-                    return Ok(Some(version));
+                for entry in index.candidates {
+                    let data_ref = index.dictionary[entry.dictionary_index as usize];
+                    if data_ref != epoch.data[route.partition as usize >> 2] {
+                        return integrity();
+                    }
+                    if data_ref.length as usize > MAX_DATA_OBJECT_BYTES {
+                        return Err(ArchiveError::Limit);
+                    }
+                    let bytes = self.get_object(data_ref, MAX_DATA_OBJECT_BYTES).await?;
+                    if let Some(version) =
+                        parse_data_lookup(&bytes, &mut self.budget, entry.run_index, key, block)?
+                    {
+                        return Ok(Some(version));
+                    }
                 }
             }
         }
@@ -483,16 +593,16 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
             return Ok(None);
         }
         let bytes = self
-            .get_object(partition_manifest, CHECKPOINT_PARTITION_MANIFEST_BYTES)
+            .get_object(partition_manifest, MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES)
             .await?;
         self.budget.decoded(bytes.len())?;
         let subshards = parse_checkpoint_partition_manifest(&bytes)?;
-        let subshard = subshards[route.subshard as usize];
+        let subshard = subshards[checkpoint_subshard(key, subshards.len())?];
         if subshard.empty() {
             return Ok(None);
         }
         let bytes = self
-            .get_uncached_object(subshard, MAX_CHECKPOINT_OBJECT_BYTES)
+            .get_object(subshard, MAX_CHECKPOINT_OBJECT_BYTES)
             .await?;
         let pointer = parse_checkpoint_lookup(&bytes, &mut self.budget, key)?;
         drop(bytes);
@@ -552,7 +662,7 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
             return Ok(Vec::new());
         }
         let bytes = self.get_object(reference, MAX_CODE_OBJECT_BYTES).await?;
-        charge_and_verify_code(bytes, account.code_hash, &mut self.budget)
+        charge_and_verify_code(&bytes, account.code_hash, &mut self.budget)
     }
 }
 
@@ -567,9 +677,22 @@ async fn get_verified<S: ObjectStore>(
     if reference.length as usize > maximum {
         return Err(ArchiveError::Limit);
     }
+    budget.reserve_fetch(reference.length as usize)?;
+    get_verified_reserved(store, prefix, reference, maximum).await
+}
+
+async fn get_verified_reserved<S: ObjectStore>(
+    store: &S,
+    prefix: &str,
+    reference: ObjectRef,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    validate_ref(reference, false)?;
+    if reference.length as usize > maximum {
+        return Err(ArchiveError::Limit);
+    }
     let digest = hex::encode(reference.digest);
     let key = format!("{prefix}objects/sha256/{}/{digest}", &digest[..2]);
-    budget.reserve_fetch(reference.length as usize)?;
     let bytes = store.get(&key, reference.length as usize).await?;
     if bytes.len() != reference.length as usize
         || Sha256::digest(&bytes).as_slice() != reference.digest
@@ -763,17 +886,31 @@ fn parse_checkpoint_manifest(bytes: &[u8]) -> Result<CheckpointManifest> {
     })
 }
 
-fn parse_checkpoint_partition_manifest(bytes: &[u8]) -> Result<[ObjectRef; CHECKPOINT_SUBSHARDS]> {
-    if bytes.len() != CHECKPOINT_PARTITION_MANIFEST_BYTES {
-        return integrity();
+fn parse_checkpoint_partition_manifest(bytes: &[u8]) -> Result<Vec<ObjectRef>> {
+    if bytes.len() > MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES {
+        return Err(ArchiveError::Limit);
     }
     let mut c = Cursor::new(bytes);
     c.expect(b"FSPS")?;
     c.version()?;
-    let mut subshards = [ObjectRef::default(); CHECKPOINT_SUBSHARDS];
-    for reference in &mut subshards {
-        *reference = c.object_ref()?;
-        validate_ref(*reference, true)?;
+    let (count, expected_bytes) = if bytes.len() == LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES {
+        (
+            MIN_CHECKPOINT_SUBSHARDS,
+            LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES,
+        )
+    } else {
+        let count = c.u16()? as usize;
+        validate_checkpoint_subshard_count(count)?;
+        (count, 4 + 1 + 2 + count * REF_BYTES)
+    };
+    if bytes.len() != expected_bytes {
+        return integrity();
+    }
+    let mut subshards = Vec::with_capacity(count);
+    for _ in 0..count {
+        let reference = c.object_ref()?;
+        validate_ref(reference, true)?;
+        subshards.push(reference);
     }
     c.end()?;
     Ok(subshards)
@@ -1090,15 +1227,15 @@ fn parse_data_lookup(
 }
 
 fn charge_and_verify_code(
-    bytes: Vec<u8>,
+    bytes: &[u8],
     expected_hash: [u8; 32],
     budget: &mut Budget,
 ) -> Result<Vec<u8>> {
     budget.decoded(bytes.len())?;
-    if Keccak256::digest(&bytes).as_slice() != expected_hash {
+    if Keccak256::digest(bytes).as_slice() != expected_hash {
         return integrity();
     }
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 
 fn decode_account(bytes: &[u8]) -> Result<Option<Account>> {
@@ -1137,6 +1274,21 @@ fn decode_code_meta(bytes: &[u8]) -> Result<(u64, ObjectRef)> {
     Ok((first_seen, object))
 }
 
+fn validate_checkpoint_subshard_count(count: usize) -> Result<()> {
+    if !(MIN_CHECKPOINT_SUBSHARDS..=MAX_CHECKPOINT_SUBSHARDS).contains(&count)
+        || !count.is_power_of_two()
+    {
+        return integrity();
+    }
+    Ok(())
+}
+
+fn checkpoint_subshard(key: &[u8], count: usize) -> Result<usize> {
+    validate_checkpoint_subshard_count(count)?;
+    let full = Sha256::digest(key);
+    Ok(full[12] as usize >> (8 - count.trailing_zeros() as usize))
+}
+
 fn route_key(key: &[u8]) -> Result<Route> {
     let full = Sha256::digest(key);
     let route = match key.first() {
@@ -1148,7 +1300,6 @@ fn route_key(key: &[u8]) -> Result<Route> {
     fingerprint.copy_from_slice(&full[..12]);
     Ok(Route {
         partition: route[0] >> 1,
-        subshard: full[12] >> 5,
         fingerprint,
     })
 }
@@ -1265,6 +1416,9 @@ impl<'a> Cursor<'a> {
     }
     fn byte(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.array()?))
@@ -1383,6 +1537,9 @@ mod tests {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_bytes: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
         }
     }
 
@@ -1444,12 +1601,56 @@ mod tests {
             };
             assert_eq!(
                 checkpoint_reader
-                    .get_uncached_object(oversized_checkpoint, MAX_CHECKPOINT_OBJECT_BYTES)
+                    .get_object(oversized_checkpoint, MAX_CHECKPOINT_OBJECT_BYTES)
                     .await,
                 Err(ArchiveError::Limit)
             );
             assert_eq!(checkpoint_store.0.get(), 0);
         });
+    }
+
+    #[test]
+    fn adaptive_checkpoint_manifest_count_and_routing_fail_closed() {
+        let key = [0x5au8; 21];
+        let shard8 = checkpoint_subshard(&key, 8).unwrap();
+        let shard16 = checkpoint_subshard(&key, 16).unwrap();
+        let shard256 = checkpoint_subshard(&key, 256).unwrap();
+        assert_eq!(shard16 >> 1, shard8);
+        assert_eq!(shard256 >> 5, shard8);
+        assert_eq!(checkpoint_subshard(&key, 12), Err(ArchiveError::Integrity));
+
+        let mut manifest = b"FSPS".to_vec();
+        manifest.push(VERSION);
+        manifest.extend_from_slice(&8u16.to_be_bytes());
+        manifest.extend_from_slice(&vec![0; 8 * REF_BYTES]);
+        assert_eq!(
+            parse_checkpoint_partition_manifest(&manifest)
+                .unwrap()
+                .len(),
+            8
+        );
+        let mut legacy = b"FSPS".to_vec();
+        legacy.push(VERSION);
+        legacy.extend_from_slice(&vec![0; 8 * REF_BYTES]);
+        assert_eq!(legacy.len(), LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES);
+        assert_eq!(legacy.len(), 293);
+        assert_eq!(
+            parse_checkpoint_partition_manifest(&legacy).unwrap().len(),
+            8
+        );
+
+        manifest[5..7].copy_from_slice(&12u16.to_be_bytes());
+        assert_eq!(
+            parse_checkpoint_partition_manifest(&manifest),
+            Err(ArchiveError::Integrity)
+        );
+        assert_eq!(
+            parse_checkpoint_partition_manifest(&vec![
+                0;
+                MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES + 1
+            ]),
+            Err(ArchiveError::Limit)
+        );
     }
 
     fn index_with_candidates(count: usize) -> Vec<u8> {
@@ -1481,9 +1682,7 @@ mod tests {
                 length: (MAX_INDEX_BYTES + 1) as u32,
             };
             assert_eq!(
-                bounded_reader
-                    .get_uncached_object(oversized, MAX_INDEX_BYTES)
-                    .await,
+                bounded_reader.get_object(oversized, MAX_INDEX_BYTES).await,
                 Err(ArchiveError::Limit)
             );
             assert_eq!(store.0.get(), 0);
@@ -1493,9 +1692,7 @@ mod tests {
                 length: MAX_INDEX_BYTES as u32,
             };
             assert!(matches!(
-                bounded_reader
-                    .get_uncached_object(boundary, MAX_INDEX_BYTES)
-                    .await,
+                bounded_reader.get_object(boundary, MAX_INDEX_BYTES).await,
                 Err(ArchiveError::Unavailable(_))
             ));
             assert_eq!(store.0.get(), 1);
@@ -1520,6 +1717,40 @@ mod tests {
     }
 
     #[test]
+    fn request_cache_tracks_verified_hits_misses_and_fifo_eviction() {
+        let store = CountingStore(Cell::new(0));
+        let mut reader = reader(&store);
+        let mut references = Vec::new();
+        for value in 0..=CACHE_MAX_ITEMS {
+            let bytes = vec![value as u8];
+            let reference = ObjectRef {
+                digest: Sha256::digest(&bytes).into(),
+                length: 1,
+            };
+            reader.insert_cache(reference, Arc::new(bytes));
+            references.push(reference);
+        }
+        assert_eq!(reader.cache.len(), CACHE_MAX_ITEMS);
+        assert_eq!(reader.cache_evictions, 1);
+        assert!(reader.cached_object(references[0]).unwrap().is_none());
+        assert_eq!(
+            reader.cached_object(*references.last().unwrap()).unwrap(),
+            Some(Arc::new(vec![CACHE_MAX_ITEMS as u8]))
+        );
+        assert_eq!((reader.cache_hits, reader.cache_misses), (1, 1));
+
+        let newest = *references.last().unwrap();
+        Arc::get_mut(
+            reader
+                .cache
+                .get_mut(&Reader::<CountingStore>::cache_key(newest))
+                .unwrap(),
+        )
+        .unwrap()[0] ^= 1;
+        assert_eq!(reader.cached_object(newest), Err(ArchiveError::Integrity));
+    }
+
+    #[test]
     fn fetched_bytes_are_reserved_atomically_before_io() {
         let mut head_budget = Budget::default();
         assert!(head_budget.reserve_fetch(HEAD_BYTES).is_ok());
@@ -1537,6 +1768,20 @@ mod tests {
         assert_eq!((budget.gets, budget.fetched), (7, MAX_REQUEST_BYTES - 4));
         assert!(budget.reserve_fetch(4).is_ok());
         assert_eq!((budget.gets, budget.fetched), (8, MAX_REQUEST_BYTES));
+
+        let mut wave_budget = Budget {
+            gets: MAX_REMOTE_GETS - 1,
+            fetched: 0,
+            decoded: 0,
+        };
+        assert_eq!(
+            wave_budget.reserve_fetches([1, 1]),
+            Err(ArchiveError::Limit)
+        );
+        assert_eq!(
+            (wave_budget.gets, wave_budget.fetched),
+            (MAX_REMOTE_GETS - 1, 0)
+        );
     }
 
     #[test]
@@ -1547,7 +1792,7 @@ mod tests {
             decoded: MAX_DECODED_BYTES,
         };
         assert_eq!(
-            charge_and_verify_code(vec![0xaa], [0; 32], &mut budget),
+            charge_and_verify_code(&[0xaa], [0; 32], &mut budget),
             Err(ArchiveError::Limit)
         );
 

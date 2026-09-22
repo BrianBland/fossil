@@ -5,9 +5,11 @@ All archive parsing, integrity checks, and Ethereum state queries are Rust compi
 WASM. `worker-build` generates only the Workers JS/WASM loader; there is no maintained
 JavaScript format decoder and no Worker-specific archive layout.
 
-The checked configuration binds R2 bucket `base-mainnet-fossil` as `ARCHIVE`, uses Base
-chain ID `8453`, and reads beneath `fossil-demo/`. The prefix is the archive root, which
-contains both `chains/0x2105/heads/finalized.bin` and `objects/sha256/...`.
+The checked configuration binds R2 bucket `fossil` as `ARCHIVE`, uses Base
+chain ID `8453`, and reads beneath archive root `v1/`, which contains both
+`chains/0x2105/heads/finalized.bin` and `objects/sha256/...`. The live archive has an
+exhaustive format-v1 Base genesis anchor and a complete usable state range of block
+`0..0`.
 
 ## API and limits
 
@@ -33,11 +35,14 @@ the selected completed-directory range, and uses the window's base checkpoint wh
 epoch delta contains the exact key. Explicit Ethereum absence/zero defaults are returned
 only after an exact checkpoint miss.
 
-Each lookup is bounded to 192 R2 GETs, 128 MiB fetched, and 128 MiB decoded. Every known
-ObjectRef length is reserved against the fetched-byte budget before its GET. Unlike the
-native format allowance, a Worker data object is limited to 8 MiB decoded and 8.25 MiB
-encoded, an index object is limited to 2 MiB encoded, and a checkpoint subshard is
-limited to 32 MiB decoded and 33 MiB encoded; checked demo and real
+Each lookup is bounded to 192 R2 GETs, 128 MiB fetched, and 128 MiB decoded. Epoch index
+objects are fetched in newest-first waves of at most 12 concurrent GETs. Every wave's
+known ObjectRef lengths and GET count are reserved atomically before any GET starts, and
+results are still evaluated strictly newest-to-oldest so predecessor semantics do not
+change. Format-v1 native publication and the Worker share an 8 MiB decoded/8.25 MiB
+encoded data-object cap and a 2 MiB encoded index-object cap. Checkpoint partition
+manifests select an adaptive power-of-two count from 8 through 256, while every emitted
+checkpoint shard is limited to 32 MiB decoded and 33 MiB encoded; checked demo and real
 measurement indexes are far below that cap, and oversize references fail before R2
 I/O. The deterministic 65-epoch fixture's cold active-window storage fallback is eight
 GETs; the hard per-request ceiling remains 192 GETs. Index parsing validates at most 65,536 entries, retains only up to 64
@@ -50,7 +55,19 @@ decoded buffer, and the selected value (plus ruzstd's bounded <=8 MiB window).
 Immutable references verify exact length and SHA-256, routing verifies the full key
 after its fingerprint, integer encodings must be
 canonical, and code bytes are charged to the decoded budget before Keccak-256. The
-per-request cache is limited to 32 objects/8 MiB, with a 2 MiB per-object limit.
+per-request verified immutable cache is limited to 96 objects/16 MiB, with a 2 MiB
+per-object limit. Cache hits recheck exact length and SHA-256 and allow account and
+incarnation-qualified storage lookups in the same address-routed partition to reuse
+index/data objects. No module-static cache is used: the current worker-rs execution
+model does not provide a synchronization/lifetime contract strong enough for safely
+bounded mutable cross-request WASM state, so the implementation does not pretend that
+an isolate cache is authoritative or available.
+
+`Reader::stats()` exposes deterministic per-request immutable GET, fetched-byte,
+decoded-byte, cache-hit, cache-miss, and eviction counters for fixtures and experiments.
+These counters are intentionally not response headers yet: plumbing timing and counters
+through every JSON-RPC error path would be invasive, and test/benchmark counters avoid
+exposing archive details in the public transport.
 
 The read-only transport routes are `GET|HEAD /health` and
 `GET|HEAD /objects/objects/sha256/<2-lowercase-hex>/<64-lowercase-hex>`. The shard must
@@ -96,20 +113,22 @@ npm run deploy
 ```
 
 Wrangler builds first, uploads the generated JS/WASM module, binds `ARCHIVE` to
-`base-mainnet-fossil`, and supplies `IMMUTABLE_PREFIX` and `CHAIN_ID`. Never place R2
+`fossil`, and supplies `IMMUTABLE_PREFIX` and `CHAIN_ID`. Never place R2
 credentials in source or client URLs.
 
 ## Live deployment and `cast` checks
 
-The public, read-only deployment is live at
-<https://fossil-r2-gateway.brian-t-bland.workers.dev/rpc>. It serves an exact sparse
-overlay for documented keys across Base blocks `51,232,601..51,535,000` (302,400
-blocks/303 epochs), not arbitrary-address-complete state. The tracked WETH address
-query is the native ETH balance held by the WETH contract, not ERC-20 `balanceOf`.
-See the [live demo guide](../docs/live-demo.md) for copy-paste `cast rpc` checks,
-expected outputs, publication timing, R2 inventory, environment-specific latency
-medians, and scope limitations. It requires no credentials and exposes no write,
-delete, or list operation.
+The canonical Rust/WASM deployment is live against bucket `fossil` and archive root
+`v1/`. Its Worker hostname remains anonymized in this repository; set `$FOSSIL_RPC` to
+`https://YOUR-WORKER.workers.dev/rpc`. The exhaustive Base genesis package contains
+2,064 accounts, 2,075 nonzero storage slots, and 16 unique code blobs. The current
+complete usable state range is exactly block `0..0`.
+
+See the [live genesis demo](../docs/live-demo.md) for exact `cast rpc` commands,
+expected chain/block/WETH results, anchor identities, and the current R2 inventory.
+Forward-only append requires contiguous authoritative post-state deltas or replay. The
+current data source lacks changesets before block 50,000,000, so no later complete
+state is claimed yet.
 
 ## Shared golden contract
 

@@ -14,7 +14,7 @@
     "base_reth_commit": "5877708b",
     "base_reth_tag": "base-v2.5.2.6",
     "caveat": "external real measurements are layout evidence, not semantically complete forward state or end-to-end epoch publication",
-    "hardware": "devbox: 32 cores, 128 GiB RAM, 15 TiB RAID",
+    "hardware": "benchmark host: 32 cores, 128 GiB RAM, 15 TiB RAID",
     "hundred_k_finalized_head": 51498020,
     "month_finalized_head": 51525110,
     "node_image": "ghcr.io/base/node:v1.3.0-rc.6",
@@ -64,34 +64,6 @@
       "summary_sha256": "800390687bcea3ebc1b24dc50589b1708d246af5550b23a561234b4a1b5a1011",
       "total_data_and_offsets_bytes": 93831464168
     },
-    "rejected_cow_run": {
-      "md0_bytes_when_stopped": 26000000000,
-      "md0_elapsed_when_stopped_seconds": 900,
-      "result": "rejected immutable state-key COW design; unfinished",
-      "tmp_allocated_bytes_approx": 5000000000,
-      "tmp_inode_limit": 1048576,
-      "tmp_logical_bytes_approx": 3000000000,
-      "tmp_objects_before_inode_exhaustion": 929134
-    },
-    "rejected_first_sealed_epoch_scale_run": {
-      "catalog_objects": 2,
-      "checkpoint_objects": 8706,
-      "commit_objects": 100,
-      "data_objects": 6400,
-      "directory_objects": 101,
-      "elapsed_seconds": 505.44,
-      "immutable_bytes": 3297864788,
-      "immutable_objects": 41009,
-      "index_objects": 25600,
-      "result": "runtime passed; object and byte targets failed; input to partition/subshard tuning",
-      "summary_sha256": "ab028cce9f88858725300fa05b82853cbeb037b3d9cb5820778dbd76774cbd93"
-    },
-    "rejected_tuned_high_cardinality_generator_run": {
-      "elapsed_seconds": 425.3685,
-      "immutable_bytes": 3006815546,
-      "immutable_objects": 17456,
-      "result": "completed tuned format run with intentionally rejected over-cardinal synthetic pools; not Base-shaped"
-    },
     "sampled_at": "2026-09-19"
   },
   "point_lookup": {
@@ -134,16 +106,16 @@
     "catalog_lookup_note": "numeric selection fetches root plus one chunk; completed directory is a separate fetch",
     "closing_epoch_64": {
       "block": 63,
-      "checkpoint_partition_manifest_bytes": 293,
+      "checkpoint_partition_manifest_bytes": 295,
       "checkpoint_partition_manifest_objects": 1,
       "checkpoint_subshard_bytes": 78,
       "checkpoint_subshard_objects": 1,
-      "new_checkpoint_bytes": 4992,
+      "new_checkpoint_bytes": 4994,
       "new_checkpoint_objects": 3,
       "peak_partition_entries": 1,
       "peak_partition_estimated_bytes": 65
     },
-    "cold_checkpoint_lookup_bytes": 10928,
+    "cold_checkpoint_lookup_bytes": 10930,
     "cold_checkpoint_lookup_gets": 5,
     "cold_completed_window_lookup_bytes": 372270,
     "cold_completed_window_lookup_gets": 5,

@@ -11,28 +11,30 @@ window directory, one router-delta partition per applicable epoch, fingerprint
 candidate data, and possibly one checkpoint partition manifest/subshard/data pointer.
 There are at most 64 post-checkpoint epoch deltas in a window. Completed-window
 selection costs a bounded catalog root plus one numeric chunk, independent of archive
-age. Verified immutable objects are cached
-locally, so repeated lookups can avoid remote GETs; the cache is not authoritative.
-Storage lookup additionally resolves the account incarnation.
+age. The Worker overlaps index latency in newest-first waves of at most 12. This can
+speculatively fetch the remainder of the successful wave, but never exceeds the existing
+per-request GET/byte budgets and does not fetch an older wave after a predecessor is
+found. Verified immutable objects are cached in the 96-object/16 MiB request-local cache,
+so same-partition account/storage work and repeated lookups can avoid remote GETs; the
+cache is not authoritative. Storage lookup additionally resolves the account
+incarnation. Deterministic experiment counters report immutable GETs, fetched bytes,
+decoded bytes, hits, misses, and evictions.
 
 R2 Standard is the recommended default for interactive reads. S3-compatible storage
 is portable. Provider request, storage, retrieval, and egress prices and cache behavior
 must be measured in the deployment region. Workers are future stateless readers;
 Durable Objects are not required for bulk storage or reads.
 
-## Why the state-key COW design was rejected
-
-The exact 100,000-block/1,000-block-chunk COW run created **929,134 immutable files**
-(about **3 GB logical and 5 GB allocated**) before exhausting the **1,048,576 `/tmp`
-inode** limit. A rerun on md0 accumulated **26 GB** and was still unfinished after
-**15 minutes**. This failed the scale gate even though small point benchmarks looked
-reasonable. It is retained as rejected-design evidence and must not be presented as
-production or implemented-format performance.
-
-The tuned sealed-epoch design caps ordinary epoch fanout at 32 data and 128 index-delta
+The sealed-epoch format caps ordinary epoch fanout at 32 data and 128 index-delta
 objects plus block/directory/commit objects. Exactly one closing checkpoint is emitted
-after the 64th descriptor in a window, with at most 128 partition manifests and 8
-subshards per partition.
+after the 64th descriptor in a window, with at most 128 partition manifests and an
+adaptive 8/16/.../256 subshards per nonempty partition. At the 32 MiB decoded writer
+cap this gives a structural ceiling near 8 GiB per primary partition and 1 TiB across
+all 128 partitions, before key-distribution skew and object overhead; these are format
+capacity estimates, not measured production state sizes. A 100-epoch run with one
+closing checkpoint projects 17,456 objects at the minimum fanout and has a 49,100-object
+structural ceiling if all 128 partitions require 256 shards; the latter is not a Base
+projection and exceeds the 35,000-object prototype measurement gate.
 The manual benchmark records cumulative objects, files, bytes, and elapsed time after
 every epoch rather than assuming the scale target passes.
 
@@ -59,19 +61,16 @@ The generator preserves local 1,000-block pools of 20,614/244,196 and interpolat
 piecewise through the measured 100-epoch and 1,296-epoch unions while preserving
 consecutive overlap and staying inside the month ID universes.
 
-The corrected Base-cardinality-shaped 100,000-block run completed all 100 epochs in
+The Base-cardinality-shaped 100,000-block run completed all 100 epochs in
 228.786 seconds with 17,456 immutable objects and 1,141,404,991 logical immutable
 bytes. It passed the prototype gates of ten minutes, 35,000 objects, and 2.75 GB.
 The compact checked result is `benchmarks/results/base-shaped-epoch-100k.json`;
 the full progress result has SHA-256
 `a3ac0318a50c06617b43d93f16e9487875f8e22f3d9683f450d7f357d7bd3fc4`.
 It is filesystem-backed synthetic cardinality-shaped evidence, not production R2
-performance or semantically complete forward state. This historical completed run
-predates the month-universe storage-address mapping and is not claimed as current
-100k-generator output without a rerun.
-
-The earlier 425.3685-second high-cardinality run and the 505.440-second 256/64/16
-fanout run are rejected tuning evidence, not implemented-format results.
+performance or semantically complete forward state. Its generator does not include
+the month-universe storage-address mapping used by the current generator, so a rerun
+is required before claiming current-generator performance.
 
 ## Reproduction
 
@@ -87,7 +86,7 @@ Manual chunked run (explicit scratch, no hidden `/tmp`):
 ```bash
 cargo run --release -- benchmark \
   --manual-blocks 100000 --chunk-blocks 1000 \
-  --scratch-dir /mnt/md0/fossil-epoch-bench \
+  --scratch-dir /mnt/benchmark-storage/fossil-epoch-bench \
   --output benchmarks/results/manual-100000.json
 ```
 

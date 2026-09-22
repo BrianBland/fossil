@@ -69,12 +69,8 @@ compact sibling-hash proof. Directories and other fanout objects commit encoded 
 of `ObjectRef`s by hashing the entire parent object; they do not expose a separately
 Merkleized tree over array entries.
 
-A separately Merkleized fanout and proof API is deferred unless portable compact
-proofs become a requirement. Adding one now would increase format and validation
-complexity. In particular, a second parallel root over the same blobs is rejected:
-it would duplicate commitments and create a risk that the object graph and proof tree
-diverge about what was published. The immutable commit digest already commits to the
-reachable content-addressed graph.
+Format version 1 does not provide a separate compact-proof tree or API. The immutable
+commit digest commits to the reachable content-addressed graph.
 
 ## Security boundary
 
