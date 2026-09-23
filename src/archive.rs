@@ -7,6 +7,7 @@ use crate::format::{quantity, AccountEvent, Address, BlockMeta, Hash32, StorageE
 use crate::normalized::{Mode, Package};
 use crate::store::{ArchiveStore, VersionedBytes};
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use moka::sync::Cache;
 use sha3::{Digest as _, Keccak256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -49,6 +50,8 @@ const MAX_DATA_DECODED: usize = 8 * 1024 * 1024;
 const MAX_DATA_OBJECT_BYTES: usize = MAX_DATA_DECODED + 256 * 1024;
 const MAX_CHECKPOINT_SHARD_DECODED: usize = 64 * 1024 * 1024;
 const MAX_CHECKPOINT_OBJECT_BYTES: usize = MAX_CHECKPOINT_SHARD_DECODED + 1024 * 1024;
+// ponytail: cap concurrent partitions at eight; tune after measuring memory and R2 throughput.
+const CHECKPOINT_PARTITION_CONCURRENCY: usize = 8;
 const MAX_BLOCK_DECODED: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_OBJECT_BYTES: usize = MAX_BLOCK_DECODED + 1024 * 1024;
 const MAX_CODE_OBJECT_BYTES: usize = 1024 * 1024;
@@ -1371,105 +1374,126 @@ async fn build_checkpoint(
     let base_partitions = base_manifest
         .map(|manifest| manifest.partitions)
         .unwrap_or([ObjectRef::default(); ROUTER_PARTITIONS]);
-    let mut output_partitions = [ObjectRef::default(); ROUTER_PARTITIONS];
-    let mut stats = CheckpointBuildStats::default();
-    for partition in 0..ROUTER_PARTITIONS {
-        let mut state: BTreeMap<Vec<u8>, StatePointer> = BTreeMap::new();
-        if !base_partitions[partition].is_empty() {
-            let manifest_ref = base_partitions[partition];
-            let bytes =
-                get_verified(store, manifest_ref, MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES).await?;
-            let subshards = decode_checkpoint_partition_manifest(manifest_ref, &bytes)?;
-            for reference in subshards.into_iter().filter(|item| !item.is_empty()) {
-                let bytes = get_verified(store, reference, MAX_CHECKPOINT_OBJECT_BYTES).await?;
-                state.extend(decode_checkpoint_partition(reference, &bytes)?);
+    let results: Vec<(usize, ObjectRef, CheckpointBuildStats)> = stream::iter(0..ROUTER_PARTITIONS)
+        .map(|partition| async move {
+            let mut stats = CheckpointBuildStats::default();
+            let mut output_partition = ObjectRef::default();
+            let mut state: BTreeMap<Vec<u8>, StatePointer> = BTreeMap::new();
+            if !base_partitions[partition].is_empty() {
+                let manifest_ref = base_partitions[partition];
+                let bytes =
+                    get_verified(store, manifest_ref, MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES)
+                        .await?;
+                let subshards = decode_checkpoint_partition_manifest(manifest_ref, &bytes)?;
+                for reference in subshards.into_iter().filter(|item| !item.is_empty()) {
+                    let bytes = get_verified(store, reference, MAX_CHECKPOINT_OBJECT_BYTES).await?;
+                    state.extend(decode_checkpoint_partition(reference, &bytes)?);
+                }
             }
-        }
-        for epoch in epochs {
-            let reference = epoch.data[partition >> 2];
-            if reference.is_empty() {
-                continue;
-            }
-            let bytes = get_verified(store, reference, MAX_DATA_OBJECT_BYTES).await?;
-            let data = decode_data(reference, &bytes)?;
-            for (run_index, (key, versions)) in data.runs.iter().enumerate() {
-                if route_key(key)?.partition as usize != partition {
+            for epoch in epochs {
+                let reference = epoch.data[partition >> 2];
+                if reference.is_empty() {
                     continue;
                 }
-                let version_index = versions.len() - 1;
-                if is_default(key, &versions[version_index].value)? {
-                    state.remove(key);
-                } else {
-                    state.insert(
-                        key.clone(),
-                        StatePointer {
-                            object: reference,
-                            run_index: run_index.try_into()?,
-                            version_index: version_index.try_into()?,
-                        },
-                    );
+                let bytes = get_verified(store, reference, MAX_DATA_OBJECT_BYTES).await?;
+                let data = decode_data(reference, &bytes)?;
+                for (run_index, (key, versions)) in data.runs.iter().enumerate() {
+                    if route_key(key)?.partition as usize != partition {
+                        continue;
+                    }
+                    let version_index = versions.len() - 1;
+                    if is_default(key, &versions[version_index].value)? {
+                        state.remove(key);
+                    } else {
+                        state.insert(
+                            key.clone(),
+                            StatePointer {
+                                object: reference,
+                                run_index: run_index.try_into()?,
+                                version_index: version_index.try_into()?,
+                            },
+                        );
+                    }
                 }
             }
-        }
 
-        // Accounts and every storage incarnation share this primary partition.
-        // Resolve final account state, then retain storage only for a live account's
-        // final incarnation. Historical epoch objects remain untouched.
-        let mut decoded_cache = CheckpointDataCache::default();
-        let mut accounts: BTreeMap<[u8; 20], u64> = BTreeMap::new();
-        for (key, pointer) in state
-            .iter()
-            .filter(|(key, _)| key.first() == Some(&NS_ACCOUNT))
-        {
-            let value = pointer_value(store, *pointer, &mut decoded_cache).await?;
-            let address: [u8; 20] = key[1..21].try_into().unwrap();
-            let account = decode_account(0, Address(address), &value)?;
-            if account.exists {
-                accounts.insert(address, account.incarnation);
+            // Accounts and every storage incarnation share this primary partition.
+            // Resolve final account state, then retain storage only for a live account's
+            // final incarnation. Historical epoch objects remain untouched.
+            let mut decoded_cache = CheckpointDataCache::default();
+            let mut accounts: BTreeMap<[u8; 20], u64> = BTreeMap::new();
+            for (key, pointer) in state
+                .iter()
+                .filter(|(key, _)| key.first() == Some(&NS_ACCOUNT))
+            {
+                let value = pointer_value(store, *pointer, &mut decoded_cache).await?;
+                let address: [u8; 20] = key[1..21].try_into().unwrap();
+                let account = decode_account(0, Address(address), &value)?;
+                if account.exists {
+                    accounts.insert(address, account.incarnation);
+                }
             }
-        }
-        state.retain(|key, _| {
-            if key.first() != Some(&NS_STORAGE) || key.len() < 29 {
-                return true;
-            }
-            let address: [u8; 20] = key[1..21].try_into().unwrap();
-            let incarnation = u64::from_be_bytes(key[21..29].try_into().unwrap());
-            accounts.get(&address) == Some(&incarnation)
-        });
+            state.retain(|key, _| {
+                if key.first() != Some(&NS_STORAGE) || key.len() < 29 {
+                    return true;
+                }
+                let address: [u8; 20] = key[1..21].try_into().unwrap();
+                let incarnation = u64::from_be_bytes(key[21..29].try_into().unwrap());
+                accounts.get(&address) == Some(&incarnation)
+            });
 
-        let estimated_bytes: u64 = state
-            .keys()
-            .map(|key| (key.len() + REF_BYTES + 8) as u64)
-            .sum();
-        stats.peak_partition_entries = stats.peak_partition_entries.max(state.len() as u64);
-        stats.peak_partition_estimated_bytes =
-            stats.peak_partition_estimated_bytes.max(estimated_bytes);
+            let estimated_bytes: u64 = state
+                .keys()
+                .map(|key| (key.len() + REF_BYTES + 8) as u64)
+                .sum();
+            stats.peak_partition_entries = stats.peak_partition_entries.max(state.len() as u64);
+            stats.peak_partition_estimated_bytes =
+                stats.peak_partition_estimated_bytes.max(estimated_bytes);
 
-        let subshard_count = select_checkpoint_subshard_count(&state, CHECKPOINT_SHARD_TARGET)?;
-        let mut subgroups: Vec<BTreeMap<Vec<u8>, StatePointer>> =
-            (0..subshard_count).map(|_| BTreeMap::new()).collect();
-        for (key, pointer) in state {
-            let subshard = checkpoint_subshard(&key, subshard_count)?;
-            subgroups[subshard].insert(key, pointer);
-        }
-        let mut subshards = vec![ObjectRef::default(); subshard_count];
-        for (subshard, entries) in subgroups.into_iter().enumerate() {
-            if entries.is_empty() {
-                continue;
+            let subshard_count = select_checkpoint_subshard_count(&state, CHECKPOINT_SHARD_TARGET)?;
+            let mut subgroups: Vec<BTreeMap<Vec<u8>, StatePointer>> =
+                (0..subshard_count).map(|_| BTreeMap::new()).collect();
+            for (key, pointer) in state {
+                let subshard = checkpoint_subshard(&key, subshard_count)?;
+                subgroups[subshard].insert(key, pointer);
             }
-            let bytes = encode_checkpoint_partition(&entries)?;
-            let reference = put_object(store, &bytes).await?;
-            stats.subshard_objects += 1;
-            stats.subshard_bytes += bytes.len() as u64;
-            subshards[subshard] = reference;
-        }
-        if subshards.iter().any(|item| !item.is_empty()) {
-            let bytes = encode_checkpoint_partition_manifest(&subshards)?;
-            let reference = put_object(store, &bytes).await?;
-            stats.partition_manifest_objects += 1;
-            stats.partition_manifest_bytes += bytes.len() as u64;
-            output_partitions[partition] = reference;
-        }
+            let mut subshards = vec![ObjectRef::default(); subshard_count];
+            for (subshard, entries) in subgroups.into_iter().enumerate() {
+                if entries.is_empty() {
+                    continue;
+                }
+                let bytes = encode_checkpoint_partition(&entries)?;
+                let reference = put_object(store, &bytes).await?;
+                stats.subshard_objects += 1;
+                stats.subshard_bytes += bytes.len() as u64;
+                subshards[subshard] = reference;
+            }
+            if subshards.iter().any(|item| !item.is_empty()) {
+                let bytes = encode_checkpoint_partition_manifest(&subshards)?;
+                let reference = put_object(store, &bytes).await?;
+                stats.partition_manifest_objects += 1;
+                stats.partition_manifest_bytes += bytes.len() as u64;
+                output_partition = reference;
+            }
+            Ok::<_, anyhow::Error>((partition, output_partition, stats))
+        })
+        .buffer_unordered(CHECKPOINT_PARTITION_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let mut output_partitions = [ObjectRef::default(); ROUTER_PARTITIONS];
+    let mut stats = CheckpointBuildStats::default();
+    for (partition, reference, part) in results {
+        output_partitions[partition] = reference;
+        stats.peak_partition_entries = stats
+            .peak_partition_entries
+            .max(part.peak_partition_entries);
+        stats.peak_partition_estimated_bytes = stats
+            .peak_partition_estimated_bytes
+            .max(part.peak_partition_estimated_bytes);
+        stats.subshard_objects += part.subshard_objects;
+        stats.subshard_bytes += part.subshard_bytes;
+        stats.partition_manifest_objects += part.partition_manifest_objects;
+        stats.partition_manifest_bytes += part.partition_manifest_bytes;
     }
     let boundary = epochs
         .last()
@@ -2360,6 +2384,8 @@ mod tests {
     struct CountingStore {
         inner: MemoryArchiveStore,
         reads: AtomicU64,
+        puts_in_flight: AtomicU64,
+        peak_puts_in_flight: AtomicU64,
     }
 
     #[async_trait]
@@ -2373,7 +2399,13 @@ mod tests {
             self.inner.get_bounded(key, maximum).await
         }
         async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
-            self.inner.put_immutable(key, bytes).await
+            let in_flight = self.puts_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_puts_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            let result = self.inner.put_immutable(key, bytes).await;
+            self.puts_in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
         }
         async fn read_mutable(&self, key: &str) -> Result<Option<VersionedBytes>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
@@ -2900,6 +2932,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let peak = store.peak_puts_in_flight.load(Ordering::SeqCst);
+        assert!((2..=CHECKPOINT_PARTITION_CONCURRENCY as u64).contains(&peak));
 
         let publication = Publication::load(store.clone(), 1).await.unwrap();
         assert_eq!(publication.commit.active_window_start, 66);
