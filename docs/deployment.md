@@ -49,14 +49,14 @@ a read-only streaming gateway restricted to canonical
 heads are reachable only by RPC internals. There are no list or write operations and no
 custom `fossil_*` RPC methods.
 
-The canonical live deployment binds bucket `fossil` and archive root prefix `v1/`.
-It serves an exhaustive format-v1 Base genesis anchor with a complete usable state
-range of block `0..0`; the repository uses the anonymized `$FOSSIL_RPC` placeholder
-rather than publishing its Worker hostname. The checked
-[live demo](live-demo.md) records exact `cast` checks and the current R2 inventory.
-Forward-only append requires contiguous authoritative post-state deltas or replay. The
-current data source lacks changesets before block 50,000,000, so it cannot connect the
-genesis anchor to later available history and no later complete state is claimed.
+The canonical live deployment binds R2 bucket `fossil` under `v1/` and serves an
+exhaustive Base genesis anchor with contiguous finalized replay deltas. On
+2026-09-23 the published head was verified at block 1,278,000 and continues
+to advance; query `eth_blockNumber` for the current range. The checked
+[live demo](live-demo.md) uses the anonymized `$FOSSIL_RPC` placeholder.
+The bounded [Base exporter](../tools/base-export/README.md) replays the full
+archive node read-only, records storage-wipe lifetimes, and commits heads last.
+It is not a full-history export; input state roots remain trusted.
 
 The edge implementation supports bounded completed-window catalog selection and exact
 checkpoint fallback as well as the active window. Worker-specific object caps remain

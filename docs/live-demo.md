@@ -1,4 +1,4 @@
-# Live Base genesis R2/Cloudflare Worker demo
+# Live Base genesis-forward R2/Cloudflare Worker demo
 
 The canonical Rust/WASM Cloudflare Worker deployment serves a Fossil format-v1
 archive directly from R2:
@@ -7,7 +7,8 @@ archive directly from R2:
 - R2 bucket: `fossil`;
 - archive root: `v1/`;
 - chain: Base, chain ID `8453` (`0x2105`); and
-- complete usable state range: **block `0..0`**.
+- contiguous published range: **block `0..eth_blockNumber`**, verified through at least
+  block 1,278,000 on 2026-09-23.
 
 The endpoint remains a placeholder here deliberately. Do not put R2 credentials in
 client commands or URLs. The Worker is read-only and exposes no write, delete, or list
@@ -34,10 +35,10 @@ exhaustive allocation. Fossil retains the authoritative block hash and state roo
 it does not independently reconstruct the Ethereum trie; as elsewhere in the format,
 the exporter and anchor package are trusted inputs.
 
-The live `v1/` R2 prefix currently contains 485 objects totaling 230,581 bytes. This
-inventory is a point-in-time deployment observation, not an SLA or a claim about
-future archive size. The compact machine-readable record is
-[`benchmarks/results/live-genesis-demo.json`](../benchmarks/results/live-genesis-demo.json).
+The genesis-only `v1/` deployment originally held 485 objects totaling 230,581 bytes.
+That historical inventory and its block-0 observations are recorded in
+[`benchmarks/results/live-genesis-demo.json`](../benchmarks/results/live-genesis-demo.json);
+the archive now appends forward, so those are **not** current bucket totals.
 
 ## Exact `cast` checks
 
@@ -52,7 +53,7 @@ cast rpc --rpc-url "$FOSSIL_RPC" eth_chainId
 # "0x2105"
 
 cast rpc --rpc-url "$FOSSIL_RPC" eth_blockNumber
-# "0x0"
+# The advancing Fossil publication head; at least "0x138030" as of 2026-09-23.
 
 cast rpc --rpc-url "$FOSSIL_RPC" eth_getBalance "$WETH" 0x0
 # "0x0"
@@ -63,18 +64,25 @@ cast rpc --rpc-url "$FOSSIL_RPC" eth_getTransactionCount "$WETH" 0x0
 CODE=$(cast rpc --rpc-url "$FOSSIL_RPC" eth_getCode "$WETH" 0x0 | jq -r .)
 printf '%s\n' "$(( (${#CODE} - 2) / 2 ))"
 # 2041
+
+cast rpc --rpc-url "$FOSSIL_RPC" eth_getTransactionCount \
+  0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001 0xfa00
+# "0xfa00" (block 64,000, across a completed-window checkpoint)
 ```
 
-These are standard Ethereum JSON-RPC methods. The final check strips the JSON quotes
+These are standard Ethereum JSON-RPC methods. The code-length check strips the JSON quotes
 and converts the returned `0x`-prefixed bytecode hex length to bytes. The WETH
 predeploy has zero native ETH balance and nonce at genesis; its 2,041-byte code confirms
 that a zero balance is not being confused with an absent account.
 
-## Why the current range ends at block 0
+## Forward export status
 
-Fossil publication is forward-only. Extending an exhaustive genesis anchor requires
-contiguous, authoritative post-state deltas for every following block, either supplied
-directly or derived by replay. The current data source lacks changesets before block
-50,000,000, so it cannot bridge block 0 to the available later history. Consequently,
-no later complete Base state is claimed yet: the current complete usable state range is
-exactly **block `0..0`**.
+Fossil appends only contiguous finalized post-state deltas from its exhaustive
+genesis anchor. The read-only [Base exporter](../tools/base-export/README.md)
+re-executes archived blocks, validates post-execution receipts, preserves
+account/storage incarnations, and publishes immutable R2 objects before a
+conditional head update. The published head was verified at block 1,278,000 on
+2026-09-23; use `eth_blockNumber` for its current value. Sampled Worker
+balance/nonce/code/storage reads matched Base across genesis and completed-window
+boundaries. This is still a partial history capped at 5 GB, not full Base mainnet
+history or an independent Ethereum state-root proof.

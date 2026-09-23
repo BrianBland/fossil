@@ -145,15 +145,14 @@ not a DHT or federation. State epochs, indexes, checkpoints, directories, catalo
 and code are durable. Publication never deletes. Offline inventory and garbage
 collection are future work.
 
-The native Tokio/Axum binary is the full JSON-RPC server. The Rust/WASM Cloudflare
-Worker is a bounded catalog/checkpoint reader and read-only object gateway, not a
-second archive. The canonical [live genesis deployment](docs/live-demo.md) serves
-standard balance, nonce, code, storage, chain ID, block-number, and client-version
-methods directly from bucket `fossil` under archive root `v1/`. It is exhaustive for
-Base block 0, and its current complete usable state range is exactly block `0..0`.
-Forward-only append requires contiguous authoritative post-state deltas or replay; the
-current data source lacks changesets before block 50,000,000, so no later complete
-state is claimed yet. Logs and historical EVM execution are not implemented.
+The native Tokio/Axum server and Rust/WASM Cloudflare Worker read one archive. The
+canonical [Base deployment](docs/live-demo.md) uses bucket `fossil` under `v1/`:
+an exhaustive block-0 anchor plus contiguous finalized post-state deltas. Its
+published range is at least block `0..1,278,000` as of 2026-09-23; use
+`eth_blockNumber` for the current, advancing head. This is a bounded demo, not
+full Base history. The [read-only Base exporter](tools/base-export/README.md)
+re-executes historical blocks, tracks storage-wipe incarnations, and publishes
+head-last under a 5 GB cap. Logs and historical EVM execution remain unsupported.
 
 Input remains canonical `fossil-export/1`. The exporter/finality source is trusted.
 Fossil validates continuity, references, bounds, and content integrity, but SHA-256

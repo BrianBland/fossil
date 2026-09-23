@@ -6,10 +6,9 @@ WASM. `worker-build` generates only the Workers JS/WASM loader; there is no main
 JavaScript format decoder and no Worker-specific archive layout.
 
 The checked configuration binds R2 bucket `fossil` as `ARCHIVE`, uses Base
-chain ID `8453`, and reads beneath archive root `v1/`, which contains both
-`chains/0x2105/heads/finalized.bin` and `objects/sha256/...`. The live archive has an
-exhaustive format-v1 Base genesis anchor and a complete usable state range of block
-`0..0`.
+chain ID `8453`, and reads under `v1/`. The live archive has an exhaustive
+Base genesis anchor and contiguous finalized replay deltas, verified through
+block 1,278,000 on 2026-09-23; query `eth_blockNumber` for its advancing head.
 
 ## API and limits
 
@@ -118,17 +117,14 @@ credentials in source or client URLs.
 
 ## Live deployment and `cast` checks
 
-The canonical Rust/WASM deployment is live against bucket `fossil` and archive root
-`v1/`. Its Worker hostname remains anonymized in this repository; set `$FOSSIL_RPC` to
-`https://YOUR-WORKER.workers.dev/rpc`. The exhaustive Base genesis package contains
-2,064 accounts, 2,075 nonzero storage slots, and 16 unique code blobs. The current
-complete usable state range is exactly block `0..0`.
-
-See the [live genesis demo](../docs/live-demo.md) for exact `cast rpc` commands,
-expected chain/block/WETH results, anchor identities, and the current R2 inventory.
-Forward-only append requires contiguous authoritative post-state deltas or replay. The
-current data source lacks changesets before block 50,000,000, so no later complete
-state is claimed yet.
+The canonical Rust/WASM deployment is live against bucket `fossil` under `v1/`.
+Its Worker hostname stays anonymized in this repository; set `$FOSSIL_RPC` to
+`https://YOUR-WORKER.workers.dev/rpc`. The exhaustive genesis package has
+2,064 accounts, 2,075 nonzero storage slots, and 16 unique code blobs.
+The [live demo](../docs/live-demo.md) records exact genesis checks and the
+historical anchor inventory. The read-only [Base exporter](../tools/base-export/README.md)
+appends contiguous replayed history under a 5 GB cap. This is a partial
+archive, not a claim that all later Base state has been exported.
 
 ## Shared golden contract
 

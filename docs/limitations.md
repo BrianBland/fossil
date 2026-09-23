@@ -1,8 +1,8 @@
 # Limitations
 
 - Fossil is a focused sealed-epoch prototype, not a production archive-node replacement.
-  No direct execution-client exporter or version-pinned chain compatibility suite is
-  included.
+  A bounded, version-pinned [Base exporter](../tools/base-export/README.md) exists
+  but requires a verified genesis-forward baseline and has no multi-chain suite.
 - Supplied flat values/state roots are retained, but trie proofs and independent
   Ethereum state-root reconstruction are absent. Hashes prove object integrity, not
   publisher authenticity, consensus, or semantic correctness. Exporter/checkpoint
@@ -53,13 +53,11 @@
   reads, but it is not broader R2 conditional-write/load testing, an availability or
   latency SLA, or AWS S3/MinIO validation. The checked inventory is a point-in-time
   observation.
-- The Rust/WASM Cloudflare Worker implements bounded active and completed-window
-  balance, nonce, code, and storage lookups, including two-level catalog selection and
-  checkpoint fallback, plus chain ID, block number, client version, and an
-  immutable-object gateway. The canonical configuration uses bucket `fossil` and
-  archive root `v1/`. Its Base block-0 anchor is exhaustive, but the current complete
-  usable state range is only block `0..0`. Forward-only append requires contiguous
-  authoritative post-state deltas or replay; the current source lacks changesets
-  before block 50,000,000, so no later complete state is claimed. The Worker does not
-  implement logs, calls, tracing, writes, deletes, or listing. The native Tokio/Axum
-  adapter remains the full JSON-RPC server. See the [live genesis demo](live-demo.md).
+- The Rust/WASM Worker serves bounded active and completed-window state lookups
+  under bucket `fossil`/`v1/`. Its Base genesis anchor is exhaustive and the
+  finalized range is appended forward; the head was verified through block
+  1,278,000 on 2026-09-23. Query `eth_blockNumber` for the current head.
+  This remains a partial, 5 GB-capped demo, not full Base history. The Worker
+  does not implement logs, calls, tracing, writes, deletes, or listing. The
+  native Tokio/Axum adapter remains the full JSON-RPC server. See the
+  [live demo](live-demo.md).
