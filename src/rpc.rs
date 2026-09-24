@@ -1,4 +1,3 @@
-use crate::archive;
 use crate::format::{
     data32, parse_quantity, quantity, quantity_u256, AccountEvent, Address, Hash32,
 };
@@ -35,46 +34,6 @@ pub trait RpcBackend: Send + Sync {
     async fn storage_at(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]>;
     async fn code_at(&self, address: Address, block: u64) -> Result<Vec<u8>>;
     async fn block_number_by_hash(&self, hash: Hash32) -> Result<Option<u64>>;
-}
-
-#[async_trait]
-impl RpcBackend for archive::Publication {
-    fn chain_id(&self) -> u64 {
-        self.commit.chain_id
-    }
-    fn generation(&self) -> u64 {
-        self.commit.generation
-    }
-    fn anchor_number(&self) -> u64 {
-        self.commit.anchor_number
-    }
-    fn published_number(&self) -> u64 {
-        self.commit.published_number
-    }
-    fn publication_digest(&self) -> Hash32 {
-        self.head.commit.digest
-    }
-    fn finalized(&self) -> bool {
-        self.commit.finalized
-    }
-    fn supports_block_hash_selector(&self) -> bool {
-        false
-    }
-    fn metrics(&self) -> String {
-        format!("fossil_publication_generation {}\nfossil_published_block {}\nfossil_archive_format 1\n", self.commit.generation, self.commit.published_number)
-    }
-    async fn account_at(&self, address: Address, block: u64) -> Result<Option<AccountEvent>> {
-        archive::Publication::account_at(self, address, block).await
-    }
-    async fn storage_at(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
-        archive::Publication::storage_at(self, address, slot, block).await
-    }
-    async fn code_at(&self, address: Address, block: u64) -> Result<Vec<u8>> {
-        archive::Publication::code_at(self, address, block).await
-    }
-    async fn block_number_by_hash(&self, hash: Hash32) -> Result<Option<u64>> {
-        archive::Publication::block_number_by_hash(self, hash).await
-    }
 }
 
 #[async_trait]
@@ -206,85 +165,6 @@ struct Request {
     params: Value,
 }
 
-pub async fn serve(
-    publication: Arc<archive::Publication>,
-    listen: SocketAddr,
-    batch_limit: usize,
-) -> Result<()> {
-    serve_backend(publication, listen, batch_limit).await
-}
-
-fn validate_refresh(
-    current: &archive::Publication,
-    candidate: &archive::Publication,
-) -> Result<bool> {
-    if candidate.head.commit == current.head.commit {
-        return Ok(false);
-    }
-    if candidate.commit.generation <= current.commit.generation
-        || candidate.commit.published_number <= current.commit.published_number
-    {
-        bail!("refresh would roll back or fail to advance the publication");
-    }
-    if candidate.commit.chain_id != current.commit.chain_id
-        || candidate.commit.genesis_hash != current.commit.genesis_hash
-        || candidate.commit.anchor_number != current.commit.anchor_number
-        || candidate.commit.anchor_hash != current.commit.anchor_hash
-    {
-        bail!("refresh publication identity is unrelated to the current chain");
-    }
-    // The authoritative mutable head may advance more than once between polls. Its
-    // audit parent is not traversed by readers, so skipped generations are valid.
-    Ok(true)
-}
-
-pub async fn serve_refreshing(
-    publication: Arc<archive::Publication>,
-    store: Arc<dyn ArchiveStore>,
-    chain_id: u64,
-    interval: Duration,
-    listen: SocketAddr,
-    batch_limit: usize,
-) -> Result<()> {
-    if interval.is_zero() {
-        bail!("refresh interval must be greater than zero");
-    }
-    let mut accepted = publication.clone();
-    let shared: Arc<RwLock<Arc<dyn RpcBackend>>> = Arc::new(RwLock::new(publication));
-    let refresh_target = shared.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            match archive::Publication::load(store.clone(), chain_id).await {
-                Ok(candidate) => match validate_refresh(accepted.as_ref(), &candidate) {
-                    Ok(true) => {
-                        accepted = Arc::new(candidate);
-                        *refresh_target.write().expect("publication lock poisoned") =
-                            accepted.clone();
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, "refresh rejected; retaining previous publication")
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "refresh rejected; retaining previous publication")
-                }
-            }
-        }
-    });
-    serve_state(
-        RpcState {
-            publication: PublicationSource::Refreshing(shared),
-            batch_limit,
-        },
-        listen,
-    )
-    .await
-}
-
 async fn serve_backend(
     publication: Arc<dyn RpcBackend>,
     listen: SocketAddr,
@@ -326,14 +206,6 @@ async fn metrics(State(state): State<RpcState>) -> impl IntoResponse {
 async fn rpc_handler(State(state): State<RpcState>, Json(value): Json<Value>) -> impl IntoResponse {
     let publication = state.snapshot();
     Json(handle_rpc_backend(publication.as_ref(), value, state.batch_limit).await)
-}
-
-pub async fn handle_rpc(
-    publication: &archive::Publication,
-    value: Value,
-    batch_limit: usize,
-) -> Value {
-    handle_rpc_backend(publication, value, batch_limit).await
 }
 
 async fn handle_rpc_backend(
@@ -553,9 +425,6 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::PublicationGate;
-    use crate::normalized::read_package;
-    use crate::store::{ArchiveStore, MemoryArchiveStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct ConcurrentBackend {
@@ -625,26 +494,6 @@ mod tests {
         }
     }
 
-    fn package(mode: &str, block: u8) -> Vec<u8> {
-        let hash = Hash32([block + 1; 32]);
-        let genesis = Hash32([1; 32]);
-        let header = if mode == "anchor" {
-            format!("{{\"type\":\"header\",\"schema\":\"fossil-export/1\",\"chain_id\":\"0x1\",\"genesis_hash\":\"{genesis}\",\"mode\":\"anchor\",\"anchor_number\":\"0x0\",\"anchor_hash\":\"{hash}\"}}")
-        } else {
-            let previous = Hash32([block; 32]);
-            format!("{{\"type\":\"header\",\"schema\":\"fossil-export/1\",\"chain_id\":\"0x1\",\"genesis_hash\":\"{genesis}\",\"mode\":\"delta\",\"preceding_number\":\"0x{:x}\",\"preceding_hash\":\"{previous}\"}}", block - 1)
-        };
-        let parent = if block == 0 {
-            Hash32([0; 32])
-        } else {
-            Hash32([block; 32])
-        };
-        format!(
-            "{header}\n{{\"type\":\"block\",\"number\":\"0x{block:x}\",\"hash\":\"{hash}\",\"parent_hash\":\"{parent}\",\"state_root\":\"{}\",\"timestamp\":\"0x{block:x}\"}}\n{{\"type\":\"block_end\",\"number\":\"0x{block:x}\",\"event_count\":\"0x0\"}}\n{{\"type\":\"trailer\",\"end_number\":\"0x{block:x}\",\"end_hash\":\"{hash}\",\"block_count\":\"0x1\"}}\n",
-            Hash32([100 + block; 32])
-        ).into_bytes()
-    }
-
     #[tokio::test]
     async fn batch_runs_at_most_eight_entries_concurrently_and_preserves_order() {
         let backend = ConcurrentBackend::new();
@@ -667,50 +516,5 @@ mod tests {
             .collect();
         assert_eq!(ids, (0..12).collect::<Vec<_>>());
         assert_eq!(backend.max_in_flight.load(Ordering::SeqCst), 8);
-    }
-
-    #[tokio::test]
-    async fn refresh_ignores_equal_accepts_skips_and_rejects_rollback_or_unrelated() {
-        let store: Arc<dyn ArchiveStore> = Arc::new(MemoryArchiveStore::default());
-        archive::publish(
-            store.clone(),
-            read_package(&package("anchor", 0)).unwrap(),
-            PublicationGate::Finalized {
-                number: 0,
-                hash: Hash32([1; 32]),
-            },
-        )
-        .await
-        .unwrap();
-        let first = archive::Publication::load(store.clone(), 1).await.unwrap();
-        assert!(!validate_refresh(&first, &first).unwrap());
-
-        archive::publish(
-            store.clone(),
-            read_package(&package("delta", 1)).unwrap(),
-            PublicationGate::Finalized {
-                number: 1,
-                hash: Hash32([2; 32]),
-            },
-        )
-        .await
-        .unwrap();
-        let second = archive::Publication::load(store, 1).await.unwrap();
-        assert!(validate_refresh(&first, &second).unwrap());
-        assert!(validate_refresh(&second, &first).is_err());
-
-        let mut unrelated = second.clone();
-        unrelated.commit.genesis_hash = Hash32([99; 32]);
-        assert!(validate_refresh(&first, &unrelated).is_err());
-        let mut skipped = second.clone();
-        skipped.commit.generation = 3;
-        skipped.commit.published_number = 2;
-        skipped.head.generation = 3;
-        skipped.head.number = 2;
-        skipped.commit.parent = archive::ObjectRef {
-            digest: Hash32([88; 32]),
-            length: 1,
-        };
-        assert!(validate_refresh(&first, &skipped).unwrap());
     }
 }

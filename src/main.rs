@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use fossil::archive::PublicationGate;
 use fossil::bootstrap::genesis_anchor;
 use fossil::format::{parse_quantity, Hash32};
 use fossil::normalized::read_package;
 use fossil::rpc::serve_tiered;
 use fossil::store::open_store;
 use fossil::tiered;
+use fossil::tiered::PublicationGate;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -33,8 +33,6 @@ enum Command {
     Verify(StoreArgs),
     /// Measure cold GETs and bytes of account-plus-storage reads over samples.
     Probe(ProbeArgs),
-    /// Run the fixed-seed local headline benchmark.
-    Benchmark(BenchmarkArgs),
 }
 
 #[derive(Args, Clone)]
@@ -90,22 +88,6 @@ struct AnchorArgs {
     /// Normalized fossil-export/1 JSONL destination.
     #[arg(long)]
     output: PathBuf,
-}
-
-#[derive(Args)]
-struct BenchmarkArgs {
-    /// Also write the machine-readable JSON result to this path.
-    #[arg(long)]
-    output: Option<PathBuf>,
-    /// Run the chunked manual benchmark for this many blocks (not run in CI).
-    #[arg(long)]
-    manual_blocks: Option<u64>,
-    /// Blocks generated and dropped per manual benchmark chunk.
-    #[arg(long, default_value_t = 1_000)]
-    chunk_blocks: u64,
-    /// Explicit filesystem scratch directory for manual runs (never defaults to /tmp).
-    #[arg(long)]
-    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -167,21 +149,8 @@ async fn main() -> Result<()> {
         }
         Command::Serve(args) => run_server(args).await,
         Command::Verify(args) => verify(args).await,
-        Command::Benchmark(args) => benchmark(args).await,
         Command::Probe(args) => probe(args).await,
     }
-}
-
-async fn benchmark(args: BenchmarkArgs) -> Result<()> {
-    let result = fossil::benchmark::run(
-        args.output.as_deref(),
-        args.manual_blocks,
-        args.chunk_blocks,
-        args.scratch_dir.as_deref(),
-    )
-    .await?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
 }
 
 async fn archive(args: ArchiveArgs) -> Result<()> {

@@ -65,10 +65,3 @@ pub fn anchor_package() -> Vec<u8> {
     )
     .into_bytes()
 }
-
-pub fn finalized(number: u64) -> fossil::archive::PublicationGate {
-    fossil::archive::PublicationGate::Finalized {
-        number,
-        hash: Hash32([number as u8; 32]),
-    }
-}

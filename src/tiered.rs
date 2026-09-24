@@ -6,7 +6,6 @@
 //! oldest `L0_TRIGGER` L0 runs, cascading through levels, and commits by CAS
 //! against whatever head the publisher has advanced to meanwhile.
 
-use crate::archive::PublicationGate;
 use crate::compact::{fetch, merge_runs, write_sorted, BuiltRun};
 use crate::format::{AccountEvent, Address, Hash32};
 use crate::normalized::{Mode, Package};
@@ -24,6 +23,20 @@ use sha3::{Digest, Keccak256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Canonicality evidence for the last block of a package being published.
+#[derive(Clone, Debug)]
+pub enum PublicationGate {
+    Finalized {
+        number: u64,
+        hash: Hash32,
+    },
+    FixedOffset {
+        observed_number: u64,
+        observed_hash: Hash32,
+        offset: u64,
+    },
+}
 
 const MAX_STAGED: usize = 256 * 1024 * 1024;
 const MAX_CODE: usize = 1024 * 1024;

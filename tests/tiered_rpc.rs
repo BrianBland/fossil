@@ -152,5 +152,25 @@ async fn cli_publishes_compacts_verifies_and_serves_tiered_state() {
         100,
     )
     .await;
-    assert!(beyond.get("error").is_some(), "{beyond}");
+    assert_eq!(beyond["error"]["code"], -32001, "{beyond}");
+    let reader_ref = &reader;
+    let error = |method: &str, params: Value| {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+        async move { handle_rpc_with(reader_ref, request, 100).await["error"]["code"].clone() }
+    };
+    assert_eq!(
+        error("eth_getBalance", json!([ADDRESS, "pending"])).await,
+        -32602
+    );
+    assert_eq!(error("eth_getProof", json!([])).await, -32601);
+    let batch = handle_rpc_with(
+        &reader,
+        json!([
+            {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},
+            {"jsonrpc":"2.0","id":2,"method":"web3_clientVersion","params":[]}
+        ]),
+        2,
+    )
+    .await;
+    assert_eq!(batch.as_array().unwrap().len(), 2);
 }

@@ -7,7 +7,7 @@ block after the bootstrap boundary must immediately follow a committed parent.
 ## Bootstrap and folding
 
 An anchor package is exhaustive at block S: it contains every live account, every
-nonzero storage slot, and referenced code. History before S is unavailable. A delta
+nonzero storage slot, and referenced code. Tiered v1 requires S = 0 (genesis). A delta
 package identifies the exact preceding published number/hash and records only values
 that changed. No record means inherit the prior value; it never means zero.
 
