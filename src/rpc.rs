@@ -3,6 +3,7 @@ use crate::format::{
     data32, parse_quantity, quantity, quantity_u256, AccountEvent, Address, Hash32,
 };
 use crate::store::ArchiveStore;
+use crate::tiered;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use axum::extract::State;
@@ -76,10 +77,104 @@ impl RpcBackend for archive::Publication {
     }
 }
 
+#[async_trait]
+impl RpcBackend for tiered::Reader<'static> {
+    fn chain_id(&self) -> u64 {
+        tiered::Reader::chain_id(self)
+    }
+    fn generation(&self) -> u64 {
+        self.latest_block()
+    }
+    fn anchor_number(&self) -> u64 {
+        0
+    }
+    fn published_number(&self) -> u64 {
+        self.latest_block()
+    }
+    fn publication_digest(&self) -> Hash32 {
+        self.head_digest()
+    }
+    fn finalized(&self) -> bool {
+        true
+    }
+    fn supports_block_hash_selector(&self) -> bool {
+        false
+    }
+    fn metrics(&self) -> String {
+        format!(
+            "fossil_published_block {}\nfossil_runs {}\n",
+            self.latest_block(),
+            self.run_count()
+        )
+    }
+    async fn account_at(&self, address: Address, block: u64) -> Result<Option<AccountEvent>> {
+        self.account(address, block).await
+    }
+    async fn storage_at(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
+        self.storage(address, slot, block).await
+    }
+    async fn code_at(&self, address: Address, block: u64) -> Result<Vec<u8>> {
+        self.code(address, block).await
+    }
+    async fn block_number_by_hash(&self, _hash: Hash32) -> Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
+/// Serve the tiered archive, adopting each newer verified head (including
+/// same-block compactions) at `interval`. Readers pin one head per request.
+pub async fn serve_tiered(
+    store: &'static dyn ArchiveStore,
+    chain_id: u64,
+    interval: Option<Duration>,
+    listen: SocketAddr,
+    batch_limit: usize,
+) -> Result<()> {
+    let current: Arc<dyn RpcBackend> = Arc::new(tiered::Reader::open(store, chain_id).await?);
+    let Some(interval) = interval.filter(|interval| !interval.is_zero()) else {
+        return serve_backend(current, listen, batch_limit).await;
+    };
+    let shared = Arc::new(RwLock::new(current));
+    let target = shared.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match tiered::Reader::open(store, chain_id).await {
+                Ok(candidate) => {
+                    let mut current = target.write().expect("publication lock poisoned");
+                    if candidate.latest_block() < current.published_number() {
+                        tracing::warn!("refresh would roll back; retaining previous head");
+                    } else if candidate.head_digest() != current.publication_digest() {
+                        *current = Arc::new(candidate);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "refresh rejected; retaining previous head")
+                }
+            }
+        }
+    });
+    serve_state(
+        RpcState {
+            publication: PublicationSource::Refreshing(shared),
+            batch_limit,
+        },
+        listen,
+    )
+    .await
+}
+
+/// Answer one JSON-RPC value (or batch) against any backend.
+pub async fn handle_rpc_with(backend: &dyn RpcBackend, value: Value, batch_limit: usize) -> Value {
+    handle_rpc_backend(backend, value, batch_limit).await
+}
+
 #[derive(Clone)]
 enum PublicationSource {
     Static(Arc<dyn RpcBackend>),
-    Refreshing(Arc<RwLock<Arc<archive::Publication>>>),
+    Refreshing(Arc<RwLock<Arc<dyn RpcBackend>>>),
 }
 
 #[derive(Clone)]
@@ -154,7 +249,8 @@ pub async fn serve_refreshing(
     if interval.is_zero() {
         bail!("refresh interval must be greater than zero");
     }
-    let shared = Arc::new(RwLock::new(publication));
+    let mut accepted = publication.clone();
+    let shared: Arc<RwLock<Arc<dyn RpcBackend>>> = Arc::new(RwLock::new(publication));
     let refresh_target = shared.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -162,16 +258,17 @@ pub async fn serve_refreshing(
         loop {
             ticker.tick().await;
             match archive::Publication::load(store.clone(), chain_id).await {
-                Ok(candidate) => {
-                    let mut current = refresh_target.write().expect("publication lock poisoned");
-                    match validate_refresh(current.as_ref(), &candidate) {
-                        Ok(true) => *current = Arc::new(candidate),
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "refresh rejected; retaining previous publication")
-                        }
+                Ok(candidate) => match validate_refresh(accepted.as_ref(), &candidate) {
+                    Ok(true) => {
+                        accepted = Arc::new(candidate);
+                        *refresh_target.write().expect("publication lock poisoned") =
+                            accepted.clone();
                     }
-                }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "refresh rejected; retaining previous publication")
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(%error, "refresh rejected; retaining previous publication")
                 }

@@ -14,11 +14,12 @@ use crate::run::{ObjectRef, Record, RunReader};
 use crate::store::{ArchiveStore, VersionedBytes};
 use crate::summary::{shard_path, Probe, Shard, ShardKind, MAX_SHARD_BYTES};
 use anyhow::{bail, Context, Result};
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// L0 runs folded per compaction step.
 pub const L0_TRIGGER: usize = 4;
@@ -32,6 +33,8 @@ const MAX_CODE: usize = 1024 * 1024;
 const CAS_ATTEMPTS: usize = 32;
 const MAX_REQUEST_GETS: u32 = 192;
 const MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
+/// Bound on memoized summary shards held by one pinned reader.
+const SHARD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Ref {
@@ -512,12 +515,14 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
 }
 
 /// Immutable snapshot pinned to the head read at open time. Fetched summary
-/// shards are memoized so account and storage probes of one address share GETs.
+/// shards are memoized (bounded) so account and storage probes of one address
+/// share GETs.
 pub struct Reader<'a> {
     store: &'a dyn ArchiveStore,
     head: Head,
+    head_digest: Hash32,
     runs: Vec<(Run, RunReader)>,
-    shards: Mutex<HashMap<String, Arc<Shard>>>,
+    shards: Cache<String, Arc<Shard>>,
 }
 
 /// Hard per-request resource limits, charged with each object's maximum size
@@ -539,7 +544,7 @@ impl Budget {
 }
 impl<'a> Reader<'a> {
     pub async fn open(store: &'a dyn ArchiveStore, chain_id: u64) -> Result<Self> {
-        let (_, head) = read_head(store, chain_id)
+        let (bytes, head) = read_head(store, chain_id)
             .await?
             .context("missing tiered head")?;
         let mut runs = Vec::new();
@@ -549,9 +554,13 @@ impl<'a> Reader<'a> {
         }
         Ok(Self {
             store,
+            head_digest: Hash32::digest(&bytes.bytes),
             head,
             runs,
-            shards: Mutex::new(HashMap::new()),
+            shards: Cache::builder()
+                .weigher(|_, shard: &Arc<Shard>| shard.len() as u32)
+                .max_capacity(SHARD_CACHE_BYTES)
+                .build(),
         })
     }
     pub fn latest_block(&self) -> u64 {
@@ -559,6 +568,13 @@ impl<'a> Reader<'a> {
     }
     pub fn run_count(&self) -> usize {
         self.runs.len()
+    }
+    pub fn chain_id(&self) -> u64 {
+        self.head.chain_id
+    }
+    /// SHA-256 of the exact head bytes this reader pinned.
+    pub fn head_digest(&self) -> Hash32 {
+        self.head_digest
     }
     async fn shard(
         &self,
@@ -568,8 +584,8 @@ impl<'a> Reader<'a> {
         index: u32,
     ) -> Result<Arc<Shard>> {
         let path = shard_path(run.root.digest, run.shards, kind, index);
-        if let Some(shard) = self.shards.lock().unwrap().get(&path) {
-            return Ok(shard.clone());
+        if let Some(shard) = self.shards.get(&path) {
+            return Ok(shard);
         }
         budget.charge(MAX_SHARD_BYTES)?;
         let bytes = self.store.get_bounded(&path, MAX_SHARD_BYTES).await?;
@@ -580,7 +596,7 @@ impl<'a> Reader<'a> {
             run.shards,
             &bytes,
         )?);
-        self.shards.lock().unwrap().insert(path, shard.clone());
+        self.shards.insert(path, shard.clone());
         Ok(shard)
     }
     async fn may_contain(&self, budget: &Budget, run: &Run, key: &[u8]) -> Result<bool> {
@@ -703,9 +719,8 @@ mod tests {
     use crate::format::{BlockMeta, CodeBlob, Segment, StorageEvent, SEGMENT_SCHEMA};
     use crate::normalized::read_package;
     use crate::store::MemoryArchiveStore;
-    use async_trait::async_trait;
     use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     fn h(byte: u8) -> Hash32 {
         Hash32([byte; 32])
@@ -780,47 +795,6 @@ mod tests {
     async fn drain(store: &dyn ArchiveStore) -> Result<()> {
         while compact_once(store, 1).await? {}
         Ok(())
-    }
-
-    /// Counts every GET a reader issues, including the mutable head.
-    #[derive(Default)]
-    struct Counting {
-        inner: MemoryArchiveStore,
-        gets: AtomicU64,
-    }
-    #[async_trait]
-    impl ArchiveStore for Counting {
-        async fn get(&self, key: &str) -> Result<Vec<u8>> {
-            self.gets.fetch_add(1, Ordering::Relaxed);
-            self.inner.get(key).await
-        }
-        async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
-            self.gets.fetch_add(1, Ordering::Relaxed);
-            self.inner.get_bounded(key, maximum).await
-        }
-        async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
-            self.inner.put_immutable(key, bytes).await
-        }
-        async fn read_mutable(&self, key: &str) -> Result<Option<VersionedBytes>> {
-            self.gets.fetch_add(1, Ordering::Relaxed);
-            self.inner.read_mutable(key).await
-        }
-        async fn read_mutable_bounded(
-            &self,
-            key: &str,
-            maximum: usize,
-        ) -> Result<Option<VersionedBytes>> {
-            self.gets.fetch_add(1, Ordering::Relaxed);
-            self.inner.read_mutable_bounded(key, maximum).await
-        }
-        async fn compare_and_swap(
-            &self,
-            key: &str,
-            expected: Option<&VersionedBytes>,
-            bytes: &[u8],
-        ) -> Result<()> {
-            self.inner.compare_and_swap(key, expected, bytes).await
-        }
     }
 
     #[tokio::test]
@@ -1016,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn cold_account_plus_storage_gets_are_bounded_by_run_count() -> Result<()> {
-        let store = Counting::default();
+        let store = crate::store::CountingStore::new(Arc::new(MemoryArchiveStore::default()));
         let cold = Address([0x11; 20]);
         let slot = h(2);
         publish(&store, &anchor(cold, slot)?, &gate(0, h(1))).await?;
@@ -1031,14 +1005,10 @@ mod tests {
         let measure = |address: Address| {
             let store = &store;
             async move {
-                store.gets.store(0, Ordering::Relaxed);
+                store.take();
                 let reader = Reader::open(store, 1).await?;
                 let value = reader.storage(address, slot, 200).await?;
-                Ok::<_, anyhow::Error>((
-                    value,
-                    store.gets.load(Ordering::Relaxed),
-                    reader.run_count() as u64,
-                ))
+                Ok::<_, anyhow::Error>((value, store.take().0, reader.run_count() as u64))
             }
         };
         // Genesis-only state lives in the oldest run; every newer run is skipped by summary.

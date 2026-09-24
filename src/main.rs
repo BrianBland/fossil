@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use fossil::archive::{load_head_commit, publish, Publication, PublicationGate};
+use fossil::archive::PublicationGate;
 use fossil::bootstrap::genesis_anchor;
 use fossil::format::{parse_quantity, Hash32};
 use fossil::normalized::read_package;
-use fossil::rpc::{serve, serve_refreshing};
+use fossil::rpc::serve_tiered;
 use fossil::store::open_store;
+use fossil::tiered;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -20,14 +21,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate a normalized export and atomically publish eligible state.
+    /// Validate a normalized export and atomically append it as an L0 run.
     Archive(ArchiveArgs),
+    /// Fold L0 runs into levels until none remain eligible, optionally forever.
+    Compact(CompactArgs),
     /// Build a complete block-zero export package from a genesis allocation.
     Anchor(AnchorArgs),
     /// Serve the committed archive through a small Ethereum JSON-RPC surface.
     Serve(ServeArgs),
     /// Verify the committed head and commit. Lazy objects verify when read.
     Verify(StoreArgs),
+    /// Measure cold GETs and bytes of account-plus-storage reads over samples.
+    Probe(ProbeArgs),
     /// Run the fixed-seed local headline benchmark.
     Benchmark(BenchmarkArgs),
 }
@@ -45,6 +50,33 @@ struct StoreArgs {
     /// Chain ID as a canonical Ethereum quantity.
     #[arg(long, default_value = "0x2105")]
     chain_id: String,
+}
+
+#[derive(Args)]
+struct CompactArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Keep polling for new L0 runs at this interval instead of exiting.
+    #[arg(long)]
+    follow_seconds: Option<u64>,
+}
+
+#[derive(Args)]
+struct ProbeArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// JSONL samples: {"address":"0x..","slot":"0x..","block":N}.
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long, default_value_t = 16)]
+    concurrency: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct Sample {
+    address: fossil::format::Address,
+    slot: Hash32,
+    block: u64,
 }
 
 #[derive(Args)]
@@ -125,6 +157,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Archive(args) => archive(args).await,
+        Command::Compact(args) => compact(args).await,
         Command::Anchor(args) => {
             let genesis = std::fs::read(&args.genesis).context("read genesis allocation")?;
             let block = std::fs::read(&args.block).context("read canonical block zero")?;
@@ -135,6 +168,7 @@ async fn main() -> Result<()> {
         Command::Serve(args) => run_server(args).await,
         Command::Verify(args) => verify(args).await,
         Command::Benchmark(args) => benchmark(args).await,
+        Command::Probe(args) => probe(args).await,
     }
 }
 
@@ -173,18 +207,80 @@ async fn archive(args: ArchiveArgs) -> Result<()> {
         }
     };
     let store = open(&args.store).await?;
-    let outcome = publish(store, package, gate).await?;
-    println!(
-        "published generation {} through {} ({}) commit {}{}",
-        outcome.generation,
-        outcome.published_number,
-        outcome.published_hash,
-        outcome.commit,
-        if outcome.idempotent {
-            " [idempotent]"
-        } else {
-            ""
+    tiered::publish(store.as_ref(), &package, &gate).await?;
+    let last = package.segment.blocks.last().context("empty package")?;
+    println!("published through {} ({})", last.number, last.hash);
+    Ok(())
+}
+
+async fn compact(args: CompactArgs) -> Result<()> {
+    let chain_id = parse_quantity(&args.store.chain_id)?;
+    let store = open(&args.store).await?;
+    loop {
+        let mut commits = 0;
+        while tiered::compact_once(store.as_ref(), chain_id).await? {
+            commits += 1;
         }
+        if commits > 0 {
+            tracing::info!(commits, "compacted L0 runs");
+        }
+        let Some(seconds) = args.follow_seconds else {
+            println!("compaction drained after {commits} commits");
+            return Ok(());
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    }
+}
+
+/// Every sample opens its own reader over its own counter, so each is fully cold.
+async fn probe(args: ProbeArgs) -> Result<()> {
+    use futures_util::StreamExt;
+    let chain_id = parse_quantity(&args.store.chain_id)?;
+    let store = open(&args.store).await?;
+    let samples = std::fs::read_to_string(&args.input)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Sample>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let results: Vec<Result<(u64, u64)>> = futures_util::stream::iter(samples)
+        .map(|sample| {
+            let counting = fossil::store::CountingStore::new(store.clone());
+            async move {
+                let reader = tiered::Reader::open(&counting, chain_id).await?;
+                reader
+                    .storage(sample.address, sample.slot, sample.block)
+                    .await?;
+                Ok(counting.take())
+            }
+        })
+        .buffer_unordered(args.concurrency.max(1))
+        .collect()
+        .await;
+    let errors = results.iter().filter(|result| result.is_err()).count();
+    if let Some(Err(error)) = results.iter().find(|result| result.is_err()) {
+        tracing::warn!(%error, errors, "probe samples failed");
+    }
+    let mut gets: Vec<u64> = results.iter().flatten().map(|(gets, _)| *gets).collect();
+    let mut bytes: Vec<u64> = results.iter().flatten().map(|(_, bytes)| *bytes).collect();
+    gets.sort_unstable();
+    bytes.sort_unstable();
+    let pick = |values: &[u64], quantile: f64| {
+        values
+            .get(((values.len() as f64 * quantile).ceil() as usize).saturating_sub(1))
+            .copied()
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "samples": gets.len(),
+            "errors": errors,
+            "gets_p50": pick(&gets, 0.5),
+            "gets_p99": pick(&gets, 0.99),
+            "gets_max": gets.last(),
+            "bytes_p50": pick(&bytes, 0.5),
+            "bytes_p99": pick(&bytes, 0.99),
+            "bytes_max": bytes.last(),
+        })
     );
     Ok(())
 }
@@ -194,31 +290,28 @@ async fn run_server(args: ServeArgs) -> Result<()> {
         return Err(anyhow!("--max-batch must be greater than zero"));
     }
     let chain_id = parse_quantity(&args.store.chain_id)?;
-    let store = open(&args.store).await?;
-    let publication = Arc::new(Publication::load(store.clone(), chain_id).await?);
-    match args.refresh_seconds {
-        Some(seconds) => {
-            serve_refreshing(
-                publication,
-                store,
-                chain_id,
-                std::time::Duration::from_secs(seconds),
-                args.listen,
-                args.max_batch,
-            )
-            .await
-        }
-        None => serve(publication, args.listen, args.max_batch).await,
-    }
+    // The store lives for the whole server process.
+    let store: &'static Arc<dyn fossil::store::ArchiveStore> =
+        Box::leak(Box::new(open(&args.store).await?));
+    serve_tiered(
+        store.as_ref(),
+        chain_id,
+        args.refresh_seconds.map(std::time::Duration::from_secs),
+        args.listen,
+        args.max_batch,
+    )
+    .await
 }
 
 async fn verify(args: StoreArgs) -> Result<()> {
     let chain_id = parse_quantity(&args.chain_id)?;
     let store = open(&args).await?;
-    let (head, commit) = load_head_commit(store.as_ref(), chain_id).await?;
+    let reader = tiered::Reader::open(store.as_ref(), chain_id).await?;
     println!(
-        "verified head/commit generation {} commit {} (lazy objects verify on read; this is not a full-history audit)",
-        commit.generation, head.commit.digest
+        "verified tiered head through {} with {} runs, head sha256 {} (objects verify on read; this is not a full-history audit)",
+        reader.latest_block(),
+        reader.run_count(),
+        reader.head_digest()
     );
     Ok(())
 }

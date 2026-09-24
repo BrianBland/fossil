@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert read-only Base replay into bounded fossil-export/1 batches with an incarnation journal."""
+"""Replay Base from genesis into bounded fossil-export/1 packages and append them to a tiered v1 archive."""
 import argparse
 import concurrent.futures
 import json
@@ -9,10 +9,10 @@ import resource
 import sqlite3
 import subprocess
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
-
-from publish import HEAD, Publisher, enforce_cap, parse_head
 
 GENESIS = "0xf712aa9241cc24369b143cf6dce85f0902a9731e70d66818a3a5845b296c73dd"
 MAX_INPUT = 100_000_000
@@ -22,6 +22,9 @@ REPLAY_CHUNK = 125
 ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z")
 HASH = re.compile(r"0x[0-9a-f]{64}\Z")
 QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
+MAX_BYTES = 5_000_000_000  # decimal GB, for both the local workspace and the remote prefix
+REMOTE_CHECK_EPOCHS = 25
+BACKLOG_RETRY_SECONDS = 10
 
 
 def require(condition, message):
@@ -212,21 +215,71 @@ def convert(first, last, db, destination, endpoint, replay, datadir):
             os.unlink(temporary)
 
 
+def workspace_size(root):
+    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+
+
+def enforce_cap(root, cap):
+    size = workspace_size(root)
+    require(size <= cap, f"STOPPED: {size} local workspace bytes exceeds the cap")
+    return size
+
+
+def remote_bytes(store):
+    """Total bytes under an s3:// store prefix (superseded compaction output included)."""
+    import boto3
+    url = urllib.parse.urlparse(store)
+    prefix = url.path.strip("/") + "/"
+    s3 = boto3.client("s3", endpoint_url=os.environ["CF_S3_API_ENDPOINT"], region_name="auto",
+                      aws_access_key_id=os.environ["CF_ACCESS_KEY_ID"],
+                      aws_secret_access_key=os.environ["CF_SECRET_ACCESS_KEY"])
+    total = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=url.netloc, Prefix=prefix):
+        total += sum(obj["Size"] for obj in page.get("Contents", []))
+    return total
+
+
+def fossil_env():
+    env = dict(os.environ)
+    if "CF_S3_API_ENDPOINT" in env:
+        env.setdefault("FOSSIL_S3_ENDPOINT", env["CF_S3_API_ENDPOINT"])
+        env.setdefault("AWS_REGION", "auto")
+        env.setdefault("AWS_ACCESS_KEY_ID", env.get("CF_ACCESS_KEY_ID", ""))
+        env.setdefault("AWS_SECRET_ACCESS_KEY", env.get("CF_SECRET_ACCESS_KEY", ""))
+    return env
+
+
+def publish(fossil, store, package, last, end_hash):
+    """Append one package; wait out compaction backlog; idempotent on retry."""
+    command = [str(fossil), "archive", "--input", str(package), "--store", store,
+               "--chain-id", "0x2105", "--gate", "finalized",
+               "--finalized-head", f"{last}:{end_hash}"]
+    while True:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=1800,
+                                env=fossil_env())
+        if result.returncode == 0:
+            return
+        if "backlog" in result.stderr:
+            print("WAITING for compaction backlog", flush=True)
+            time.sleep(BACKLOG_RETRY_SECONDS)
+            continue
+        raise RuntimeError(f"fossil archive failed: {result.stderr.strip()[-2000:]}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--first", required=True, type=int)
     p.add_argument("--last", required=True, type=int)
-    p.add_argument("--baseline", required=True, type=int, help="previous published system-only block; all lifetimes zero")
     p.add_argument("--workspace", required=True, type=Path)
     p.add_argument("--datadir", required=True, type=Path)
     p.add_argument("--replay", required=True, type=Path)
     p.add_argument("--fossil", required=True, type=Path)
     p.add_argument("--rpc", required=True, help="local Base JSON-RPC URL")
-    p.add_argument("--bucket", required=True)
-    p.add_argument("--prefix", default="v1/")
-    p.add_argument("--dry-run", action="store_true", help="convert one epoch, rollback journal; no R2 writes")
+    p.add_argument("--store", required=True, help="tiered store URI, e.g. s3://bucket/prefix")
+    p.add_argument("--cap-bytes", type=int, default=MAX_BYTES)
+    p.add_argument("--dry-run", action="store_true", help="convert one epoch, rollback journal; no writes")
     args = p.parse_args()
-    if args.first <= 0 or args.baseline < 0 or args.last < args.first:
+    if args.first <= 0 or args.last < args.first:
         p.error("expected positive contiguous block range")
     if args.dry_run and args.last - args.first >= 1000:
         p.error("dry-run accepts at most one 1000-block epoch")
@@ -241,25 +294,29 @@ def main():
         db.execute("CREATE TABLE IF NOT EXISTS lifetime (address TEXT PRIMARY KEY, incarnation INTEGER NOT NULL, exists_now INTEGER NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
         head = db.execute("SELECT value FROM meta WHERE key='last_block'").fetchone()
-        require((head is None and args.first == args.baseline + 1)
-                or (head is not None and head[0] == args.first - 1),
+        # Genesis accounts start at incarnation zero; the block-zero anchor is published first.
+        require((head is None and args.first == 1) or (head is not None and head[0] == args.first - 1),
                 "incarnation journal does not precede batch")
-        publisher = None if args.dry_run else Publisher(args.workspace, args.fossil, args.bucket, args.prefix)
+        remote_checked = 0
         for first in range(args.first, args.last + 1, 1000):
             last = min(first + 999, args.last)
-            require(parse_head((args.workspace / "mirror" / HEAD).read_bytes())[1] == first - 1,
-                    "local publication head does not precede batch")
-            enforce_cap(args.workspace)
+            enforce_cap(args.workspace, args.cap_bytes)
+            if not args.dry_run and args.store.startswith("s3://") and remote_checked % REMOTE_CHECK_EPOCHS == 0:
+                size = remote_bytes(args.store)
+                require(size <= args.cap_bytes, f"STOPPED: remote prefix holds {size} bytes")
+                print(f"REMOTE_BYTES {size}", flush=True)
+            remote_checked += 1
             db.execute("BEGIN IMMEDIATE")
             package = args.workspace / f"{first}-{last}.jsonl"
             try:
                 convert(first, last, db, package, args.rpc, args.replay, args.datadir)
-                enforce_cap(args.workspace)
+                enforce_cap(args.workspace, args.cap_bytes)
                 print(f"PREPARED {first}..{last} bytes={package.stat().st_size}", flush=True)
                 if args.dry_run:
                     db.rollback()
                     return
-                publisher.publish(package)
+                end_hash = json.loads(package.read_text().splitlines()[-1])["end_hash"]
+                publish(args.fossil, args.store, package, last, end_hash)
                 db.execute("INSERT OR REPLACE INTO meta VALUES ('last_block', ?)", (last,))
                 db.commit()
                 package.unlink()

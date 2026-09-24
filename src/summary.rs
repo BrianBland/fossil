@@ -234,6 +234,15 @@ impl Shard {
         })
     }
 
+    /// Decoded bitset size in bytes.
+    pub fn len(&self) -> usize {
+        self.bits.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bits.is_empty()
+    }
+
     pub fn contains(&self, item: &[u8]) -> bool {
         contains(&self.bits, &Hash32::digest(item))
     }

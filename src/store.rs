@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use url::Url;
@@ -211,6 +212,76 @@ impl ArchiveStore for MemoryArchiveStore {
         }
         state.insert(key, bytes);
         Ok(())
+    }
+}
+
+/// Wraps a store and counts every read request (immutable GETs and head reads).
+/// Used to measure cold-read cost; writes pass through uncounted.
+pub struct CountingStore {
+    pub inner: Arc<dyn ArchiveStore>,
+    pub gets: AtomicU64,
+    pub bytes: AtomicU64,
+}
+
+impl CountingStore {
+    pub fn new(inner: Arc<dyn ArchiveStore>) -> Self {
+        Self {
+            inner,
+            gets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Return and reset `(gets, bytes)`.
+    pub fn take(&self) -> (u64, u64) {
+        (
+            self.gets.swap(0, Ordering::Relaxed),
+            self.bytes.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    fn count(&self, bytes: usize) {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl ArchiveStore for CountingStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let bytes = self.inner.get(key).await?;
+        self.count(bytes.len());
+        Ok(bytes)
+    }
+    async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        let result = self.inner.get_bounded(key, maximum).await;
+        self.count(result.as_ref().map_or(0, Vec::len));
+        result
+    }
+    async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put_immutable(key, bytes).await
+    }
+    async fn read_mutable(&self, key: &str) -> Result<Option<VersionedBytes>> {
+        let result = self.inner.read_mutable(key).await;
+        self.count(0);
+        result
+    }
+    async fn read_mutable_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<VersionedBytes>> {
+        let result = self.inner.read_mutable_bounded(key, maximum).await;
+        self.count(0);
+        result
+    }
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&VersionedBytes>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.inner.compare_and_swap(key, expected, bytes).await
     }
 }
 

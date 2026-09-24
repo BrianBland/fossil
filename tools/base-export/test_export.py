@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 export = importlib.import_module("export")
-publish = importlib.import_module("publish")
 ADDRESS = "0x" + "12" * 20
 HASH = "0x" + "34" * 32
 
@@ -54,10 +53,12 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             export.decode("not JSON")
 
-    def test_remote_budget_prevents_overshoot(self):
-        publish.enforce_remote_cap(publish.MAX_BYTES - 1, 1)
-        with self.assertRaisesRegex(RuntimeError, "predicted R2 prefix exceeds 5 GB"):
-            publish.enforce_remote_cap(publish.MAX_BYTES - 1, 2)
+    def test_local_cap_stops_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "big").write_bytes(b"x" * 10)
+            export.enforce_cap(Path(tmp), 10)
+            with self.assertRaisesRegex(ValueError, "exceeds the cap"):
+                export.enforce_cap(Path(tmp), 9)
 
     def test_invalid_replay_never_installs_package(self):
         class Process:
@@ -99,38 +100,43 @@ class LifecycleTests(unittest.TestCase):
     def test_main_publishes_and_advances_journal(self):
         published = []
 
-        class FakePublisher:
-            def __init__(self, *_args):
-                pass
-
-            def publish(self, package):
-                if not package.exists():
-                    raise AssertionError("staged package is missing")
-                published.append(package.name)
+        def fake_publish(_fossil, store, package, last, end_hash):
+            if not package.exists():
+                raise AssertionError("staged package is missing")
+            published.append((package.name, store, last, end_hash))
 
         def fake_rpc(_endpoint, method, _params):
             return {"eth_chainId": "0x2105", "eth_syncing": False,
                     "eth_getBlockByNumber": {"number": "0x1"}}[method]
 
         def fake_convert(_first, _last, _db, package, *_args):
-            package.write_text("{}")
+            package.write_text('{}\n{"type":"trailer","end_hash":"%s"}\n' % HASH)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            head = root / "mirror" / export.HEAD
-            head.parent.mkdir(parents=True)
-            head.write_bytes(b"mock")
-            arguments = ["export.py", "--first", "1", "--last", "1", "--baseline", "0",
+            arguments = ["export.py", "--first", "1", "--last", "1",
                          "--workspace", tmp, "--datadir", tmp, "--replay", tmp,
-                         "--fossil", tmp, "--rpc", "http://localhost", "--bucket", "fossil"]
+                         "--fossil", tmp, "--rpc", "http://localhost", "--store", "file:///x"]
             with patch.object(sys, "argv", arguments), patch.object(export, "rpc", fake_rpc), \
-                 patch.object(export, "parse_head", return_value=(1, 0, b"")), \
-                 patch.object(export, "Publisher", FakePublisher), \
+                 patch.object(export, "publish", fake_publish), \
                  patch.object(export, "convert", fake_convert):
                 export.main()
-            self.assertEqual(published, ["1-1.jsonl"])
+            self.assertEqual(published, [("1-1.jsonl", "file:///x", 1, HASH)])
             with sqlite3.connect(root / "lifetimes.sqlite") as db:
                 self.assertEqual(db.execute("SELECT value FROM meta WHERE key='last_block'").fetchone(), (1,))
+
+    def test_publish_waits_out_compaction_backlog(self):
+        class Result:
+            def __init__(self, code, stderr):
+                self.returncode, self.stderr = code, stderr
+        results = [Result(1, "Error: tiered L0 compaction backlog is full"), Result(0, "")]
+        with patch.object(export.subprocess, "run", side_effect=lambda *a, **k: results.pop(0)), \
+             patch.object(export.time, "sleep"):
+            export.publish(Path("fossil"), "file:///x", Path("p.jsonl"), 1, HASH)
+        self.assertEqual(results, [])
+        with patch.object(export.subprocess, "run", return_value=Result(1, "boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                export.publish(Path("fossil"), "file:///x", Path("p.jsonl"), 1, HASH)
 
 
 if __name__ == "__main__":
