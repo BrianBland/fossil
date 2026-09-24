@@ -6,6 +6,7 @@ import json
 import os
 import re
 import resource
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -289,6 +290,9 @@ def main():
     require(type(finalized) is dict and args.last <= int(finalized["number"], 16),
             "unfinalized block requested")
     args.workspace.mkdir(parents=True, exist_ok=True)
+    # One exporter per workspace: staging left by a killed run is never resumed.
+    for stale in [*args.workspace.glob(".fossil-replay-*"), *args.workspace.glob(".native-export-*")]:
+        shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
     db = sqlite3.connect(args.workspace / "lifetimes.sqlite")
     try:
         db.execute("CREATE TABLE IF NOT EXISTS lifetime (address TEXT PRIMARY KEY, incarnation INTEGER NOT NULL, exists_now INTEGER NOT NULL)")

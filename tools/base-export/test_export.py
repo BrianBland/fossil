@@ -114,6 +114,8 @@ class LifecycleTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / ".fossil-replay-stale").mkdir()
+            (root / ".native-export-stale").write_text("partial")
             arguments = ["export.py", "--first", "1", "--last", "1",
                          "--workspace", tmp, "--datadir", tmp, "--replay", tmp,
                          "--fossil", tmp, "--rpc", "http://localhost", "--store", "file:///x"]
@@ -122,6 +124,7 @@ class LifecycleTests(unittest.TestCase):
                  patch.object(export, "convert", fake_convert):
                 export.main()
             self.assertEqual(published, [("1-1.jsonl", "file:///x", 1, HASH)])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["lifetimes.sqlite"])
             with sqlite3.connect(root / "lifetimes.sqlite") as db:
                 self.assertEqual(db.execute("SELECT value FROM meta WHERE key='last_block'").fetchone(), (1,))
 
