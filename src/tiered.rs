@@ -10,25 +10,22 @@ use crate::archive::PublicationGate;
 use crate::compact::{fetch, merge_runs, write_sorted, BuiltRun};
 use crate::format::{AccountEvent, Address, Hash32};
 use crate::normalized::{Mode, Package};
-use crate::run::{ObjectRef, Record, RunReader};
+use crate::run::{Record, RunReader};
 use crate::store::{ArchiveStore, VersionedBytes};
 use crate::summary::{shard_path, Probe, Shard, ShardKind, MAX_SHARD_BYTES};
 use anyhow::{bail, Context, Result};
+use fossil_codec::head::{
+    account_key, code_key, head_key, storage_key, unit, AccountState, Head, Ref, Run, FANOUT,
+    MAX_HEAD, MAX_LEVELS,
+};
+pub use fossil_codec::head::{L0_TRIGGER, MAX_L0_BACKLOG};
 use moka::sync::Cache;
-use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// L0 runs folded per compaction step.
-pub const L0_TRIGGER: usize = 4;
-/// Publication refuses to append beyond this many uncompacted L0 runs.
-pub const MAX_L0_BACKLOG: usize = 16;
-const FANOUT: u64 = 8;
-const MAX_LEVELS: usize = 8;
 const MAX_STAGED: usize = 256 * 1024 * 1024;
-const MAX_HEAD: usize = 256 * 1024;
 const MAX_CODE: usize = 1024 * 1024;
 const CAS_ATTEMPTS: usize = 32;
 const MAX_REQUEST_GETS: u32 = 192;
@@ -36,84 +33,6 @@ const MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
 /// Bound on memoized summary shards held by one pinned reader.
 const SHARD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Ref {
-    digest: Hash32,
-    length: u32,
-}
-impl From<ObjectRef> for Ref {
-    fn from(value: ObjectRef) -> Self {
-        Self {
-            digest: value.digest,
-            length: value.length,
-        }
-    }
-}
-impl From<Ref> for ObjectRef {
-    fn from(value: Ref) -> Self {
-        Self {
-            digest: value.digest,
-            length: value.length,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Run {
-    start: u64,
-    end: u64,
-    weight: u64,
-    keys: u64,
-    shards: u32,
-    root: Ref,
-    /// Hex of the 581-byte run root, verified against `root`.
-    root_bytes: String,
-}
-impl Run {
-    fn new(start: u64, end: u64, weight: u64, built: BuiltRun) -> Self {
-        Self {
-            start,
-            end,
-            weight,
-            keys: built.keys,
-            shards: built.shards,
-            root: built.root.into(),
-            root_bytes: hex::encode(built.root_bytes),
-        }
-    }
-    fn input(&self) -> Result<(ObjectRef, Vec<u8>)> {
-        Ok((self.root.into(), hex::decode(&self.root_bytes)?))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Head {
-    magic: String,
-    chain_id: u64,
-    genesis: Hash32,
-    number: u64,
-    hash: Hash32,
-    state_root: Hash32,
-    input_sha256: Hash32,
-    /// Immutable copy of the head this one replaced (publication or compaction).
-    parent: Option<Ref>,
-    l0: Vec<Run>,
-    /// `levels[i]` weight is a multiple of `unit(i)` and below `unit(i) * FANOUT`.
-    levels: Vec<Option<Run>>,
-}
-impl Head {
-    /// Runs oldest first.
-    fn runs(&self) -> impl Iterator<Item = &Run> {
-        self.levels.iter().rev().flatten().chain(self.l0.iter())
-    }
-}
-
-fn unit(level: usize) -> u64 {
-    L0_TRIGGER as u64 * FANOUT.pow(level as u32)
-}
-fn head_key(chain_id: u64) -> String {
-    format!("chains/{chain_id}/heads/tiered-v1.json")
-}
 async fn stage(store: &dyn ArchiveStore, bytes: &[u8]) -> Result<Ref> {
     let reference = Ref {
         digest: Hash32::digest(bytes),
@@ -123,45 +42,6 @@ async fn stage(store: &dyn ArchiveStore, bytes: &[u8]) -> Result<Ref> {
         .put_immutable(&reference.digest.object_key(), bytes)
         .await?;
     Ok(reference)
-}
-
-fn decode_head(bytes: &[u8]) -> Result<Head> {
-    let head: Head = serde_json::from_slice(bytes)?;
-    if head.magic != "FTVH1" || head.l0.len() > MAX_L0_BACKLOG || head.levels.len() > MAX_LEVELS {
-        bail!("invalid tiered head");
-    }
-    if head.l0.iter().any(|run| run.weight != 1) {
-        bail!("invalid L0 run weight");
-    }
-    for (index, level) in head.levels.iter().enumerate() {
-        if let Some(run) = level {
-            if run.weight == 0
-                || run.weight % unit(index) != 0
-                || run.weight >= unit(index) * FANOUT
-            {
-                bail!("invalid tiered level weight");
-            }
-        }
-    }
-    let mut expected_start = 0;
-    let mut count = 0;
-    for run in head.runs() {
-        let root = hex::decode(&run.root_bytes)?;
-        if run.start != expected_start
-            || run.start > run.end
-            || !run.shards.is_power_of_two()
-            || root.len() != run.root.length as usize
-            || Hash32::digest(&root) != run.root.digest
-        {
-            bail!("invalid tiered run interval, root or summary");
-        }
-        expected_start = run.end + 1;
-        count += 1;
-    }
-    if count == 0 || expected_start != head.number + 1 {
-        bail!("tiered runs do not cover genesis through the head");
-    }
-    Ok(head)
 }
 
 async fn read_head(
@@ -174,7 +54,7 @@ async fn read_head(
     else {
         return Ok(None);
     };
-    let head = decode_head(&bytes.bytes)?;
+    let head = Head::decode(&bytes.bytes)?;
     if head.chain_id != chain_id {
         bail!("tiered head chain mismatch");
     }
@@ -200,30 +80,27 @@ async fn swap(
         .await
 }
 
-fn account_key(address: Address) -> Vec<u8> {
-    let mut key = vec![1];
-    key.extend_from_slice(&address.0);
-    key
-}
-fn storage_key(address: Address, incarnation: u64, slot: Hash32) -> Vec<u8> {
-    let mut key = vec![2];
-    key.extend_from_slice(&address.0);
-    key.extend_from_slice(&incarnation.to_be_bytes());
-    key.extend_from_slice(&slot.0);
-    key
-}
-fn code_key(hash: Hash32) -> Vec<u8> {
-    let mut key = vec![3];
-    key.extend_from_slice(&hash.0);
-    key
-}
 fn account_value(event: &AccountEvent) -> Vec<u8> {
-    let mut out = vec![u8::from(event.exists)];
-    out.extend_from_slice(&event.incarnation.to_be_bytes());
-    out.extend_from_slice(&event.nonce.to_be_bytes());
-    out.extend_from_slice(&event.balance);
-    out.extend_from_slice(&event.code_hash.0);
-    out
+    AccountState {
+        exists: event.exists,
+        incarnation: event.incarnation,
+        nonce: event.nonce,
+        balance: event.balance,
+        code_hash: event.code_hash.0,
+    }
+    .encode()
+}
+
+fn new_run(start: u64, end: u64, weight: u64, built: BuiltRun) -> Run {
+    Run {
+        start,
+        end,
+        weight,
+        keys: built.keys,
+        shards: built.shards,
+        root: built.root.into(),
+        root_bytes: hex::encode(built.root_bytes),
+    }
 }
 
 fn package_records(package: &Package) -> Result<Vec<Record>> {
@@ -249,14 +126,14 @@ fn package_records(package: &Package) -> Result<Vec<Record>> {
     };
     for event in &segment.accounts {
         add(
-            account_key(event.address),
+            account_key(event.address.0),
             event.block,
             account_value(event),
         )?;
     }
     for event in &segment.storage {
         add(
-            storage_key(event.address, event.incarnation, event.slot),
+            storage_key(event.address.0, event.incarnation, event.slot.0),
             event.block,
             event.value.to_vec(),
         )?;
@@ -268,7 +145,7 @@ fn package_records(package: &Package) -> Result<Vec<Record>> {
             bail!("invalid or oversized code blob");
         }
         add(
-            code_key(blob.code_hash),
+            code_key(blob.code_hash.0),
             blob.first_seen_block,
             blob.bytes.clone(),
         )?;
@@ -392,7 +269,7 @@ pub async fn publish(
     }
     validate_lifecycle(package)?;
     let built = write_sorted(store, package_records(package)?).await?;
-    let run = Run::new(first.number, last.number, 1, built);
+    let run = new_run(first.number, last.number, 1, built);
     for _ in 0..CAS_ATTEMPTS {
         let next = match &previous {
             Some((_, head)) => {
@@ -486,7 +363,7 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
     let refs = inputs.iter().map(Run::input).collect::<Result<Vec<_>>>()?;
     let expected: u64 = inputs.iter().map(|run| run.keys).sum();
     let built = merge_runs(store, &refs, expected).await?;
-    levels[target] = Some(Run::new(
+    levels[target] = Some(new_run(
         inputs[0].start,
         inputs.last().unwrap().end,
         weight,
@@ -644,27 +521,18 @@ impl<'a> Reader<'a> {
         address: Address,
         block: u64,
     ) -> Result<Option<AccountEvent>> {
-        let Some(value) = self.lookup(budget, &account_key(address), block).await? else {
+        let Some(value) = self.lookup(budget, &account_key(address.0), block).await? else {
             return Ok(None);
         };
-        if value.len() != 81 || value[0] > 1 {
-            bail!("invalid full-key account poststate");
-        }
-        let incarnation = u64::from_be_bytes(value[1..9].try_into()?);
-        let nonce = u64::from_be_bytes(value[9..17].try_into()?);
-        let balance = value[17..49].try_into()?;
-        let code_hash = Hash32(value[49..81].try_into()?);
-        if value[0] == 0 && (nonce != 0 || balance != [0; 32] || code_hash != Hash32([0; 32])) {
-            bail!("invalid account tombstone");
-        }
+        let state = AccountState::decode(&value)?;
         Ok(Some(AccountEvent {
             block,
             address,
-            exists: value[0] == 1,
-            incarnation,
-            nonce,
-            balance,
-            code_hash,
+            exists: state.exists,
+            incarnation: state.incarnation,
+            nonce: state.nonce,
+            balance: state.balance,
+            code_hash: Hash32(state.code_hash),
         }))
     }
     pub async fn storage(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
@@ -678,7 +546,7 @@ impl<'a> Reader<'a> {
         let value = self
             .lookup(
                 &budget,
-                &storage_key(address, account.incarnation, slot),
+                &storage_key(address.0, account.incarnation, slot.0),
                 block,
             )
             .await?;
@@ -702,7 +570,7 @@ impl<'a> Reader<'a> {
             return Ok(Vec::new());
         }
         let bytes = self
-            .lookup(&budget, &code_key(account.code_hash), block)
+            .lookup(&budget, &code_key(account.code_hash.0), block)
             .await?
             .context("missing account code blob")?;
         if bytes.len() > MAX_CODE || Hash32(Keccak256::digest(&bytes).into()) != account.code_hash {

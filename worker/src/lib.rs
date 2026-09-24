@@ -179,10 +179,10 @@ async fn dispatch_rpc(
     }
     let prefix = archive_prefix(env)?;
     let store = R2Store(env.bucket("ARCHIVE").map_err(|_| ArchiveError::Backend)?);
-    let mut reader = Reader::load(&store, prefix, chain_id).await?;
+    let reader = Reader::load(&store, prefix, chain_id).await?;
     if method == "eth_blockNumber" {
         require_params(params, 0)?;
-        return Ok(json!(core::quantity(reader.commit.published_number)));
+        return Ok(json!(core::quantity(reader.published_number())));
     }
     let values = params
         .as_array()

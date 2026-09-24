@@ -12,6 +12,7 @@ async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
+fossil-codec = { path = "codec" }
 fs2 = "0.4"
 futures-util = "0.3"
 hex = "0.4"

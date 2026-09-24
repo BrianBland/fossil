@@ -1,70 +1,28 @@
-//! Platform-neutral, bounded Fossil format-v1 reader used by the Worker and native tests.
+//! Platform-neutral, bounded tiered v1 reader used by the Worker and native tests.
+//!
+//! One GET reads the head (whose manifest is inline); each run is then probed
+//! newest first through its no-false-negative summary shard, and positives are
+//! verified in the run's exact fence tree. Every GET is charged to a hard
+//! per-request budget before it is issued.
 
-use futures_util::future::join_all;
-use ruzstd::decoding::StreamingDecoder;
-use sha2::{Digest as _, Sha256};
-use sha3::Keccak256;
-use std::collections::{HashMap, VecDeque};
-use std::io::{Cursor as IoCursor, Read};
-use std::sync::Arc;
+use fossil_codec::head::{
+    account_key, code_key, head_key, storage_key, AccountState, Head, Run, MAX_HEAD,
+};
+use fossil_codec::run::{ObjectRef, RunReader};
+use fossil_codec::summary::{shard_path, Probe, Shard, ShardKind, MAX_SHARD_BYTES};
+use fossil_codec::Hash32;
+use sha3::{Digest as _, Keccak256};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
-const VERSION: u8 = 1;
-const HEAD_BYTES: usize = 97;
-const COMMIT_BYTES: usize = 314;
-const REF_BYTES: usize = 36;
-const ROUTER_PARTITIONS: usize = 128;
-const DATA_PARTITIONS: usize = 32;
-const EPOCHS_PER_WINDOW: usize = 64;
-const MIN_CHECKPOINT_SUBSHARDS: usize = 8;
-const MAX_CHECKPOINT_SUBSHARDS: usize = 256;
-const MAX_EPOCH_BLOCKS: u64 = 1_000;
-const MAX_DIRECTORY_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
-const CATALOG_CHUNK_ENTRIES: usize = 256;
-const MAX_CATALOG_CHUNKS: usize = 4_096;
-const CHECKPOINT_MANIFEST_BYTES: usize = 4 + 1 + 8 + ROUTER_PARTITIONS * REF_BYTES;
-const LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES: usize =
-    4 + 1 + MIN_CHECKPOINT_SUBSHARDS * REF_BYTES;
-const MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES: usize =
-    4 + 1 + 2 + MAX_CHECKPOINT_SUBSHARDS * REF_BYTES;
-// The writer hard-fails above 32 MiB decoded; this matching reader cap bounds isolates.
-pub const MAX_CHECKPOINT_DECODED: usize = 32 * 1024 * 1024;
-pub const MAX_CHECKPOINT_OBJECT_BYTES: usize = MAX_CHECKPOINT_DECODED + 1024 * 1024;
-// Shared format publication cap; measured demo/real index deltas are far below it.
-pub const MAX_INDEX_BYTES: usize = 2 * 1024 * 1024;
-const MAX_INDEX_ENTRIES: usize = 65_536;
-const MAX_INDEX_CANDIDATES: usize = 64;
-// Shared format publication cap chosen for isolate-safe decoding.
-pub const MAX_DATA_DECODED: usize = 8 * 1024 * 1024;
-pub const MAX_DATA_OBJECT_BYTES: usize = MAX_DATA_DECODED + 256 * 1024;
-const MAX_CODE_OBJECT_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_GETS: u64 = 192;
 const MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
-const INDEX_FETCH_CONCURRENCY: usize = 12;
-const CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
-const CACHE_MAX_ITEMS: usize = 96;
-const CACHE_MAX_ITEM_BYTES: usize = 2 * 1024 * 1024;
-const EMPTY_CODE_HASH: [u8; 32] =
-    hex_literal("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
-
-const fn hex_literal(value: &str) -> [u8; 32] {
-    let bytes = value.as_bytes();
-    let mut out = [0; 32];
-    let mut i = 0;
-    while i < 32 {
-        out[i] = (hex_nibble(bytes[i * 2]) << 4) | hex_nibble(bytes[i * 2 + 1]);
-        i += 1;
-    }
-    out
-}
-const fn hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        _ => 0,
-    }
-}
+const MAX_OBJECT_BYTES: usize = 1024 * 1024;
+const EMPTY_CODE_HASH: [u8; 32] = [
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArchiveError {
@@ -74,231 +32,225 @@ pub enum ArchiveError {
     InvalidParams(String),
     Backend,
 }
+impl std::fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for ArchiveError {}
+/// Store errors pass through the codec unchanged; codec errors are integrity failures.
+impl From<anyhow::Error> for ArchiveError {
+    fn from(error: anyhow::Error) -> Self {
+        error.downcast().unwrap_or(ArchiveError::Integrity)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, ArchiveError>;
-fn integrity<T>() -> Result<T> {
-    Err(ArchiveError::Integrity)
-}
 
 #[allow(async_fn_in_trait)]
 pub trait ObjectStore {
     async fn get(&self, key: &str, maximum: usize) -> Result<Vec<u8>>;
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ObjectRef {
-    digest: [u8; 32],
-    length: u32,
-}
-impl ObjectRef {
-    fn empty(self) -> bool {
-        self == Self::default()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Commit {
-    pub generation: u64,
-    pub chain_id: u64,
-    pub anchor_number: u64,
-    pub published_number: u64,
-    pub finalized: bool,
-    pub active_window_start: u64,
-    active_directory: ObjectRef,
-    completed_catalog: ObjectRef,
-    published_hash: [u8; 32],
-}
-
-#[derive(Clone, Debug)]
-struct Head {
-    generation: u64,
-    chain_id: u64,
-    number: u64,
-    hash: [u8; 32],
-    commit: ObjectRef,
-}
-#[derive(Clone, Debug)]
-struct Epoch {
-    start: u64,
-    end: u64,
-    data: Vec<ObjectRef>,
-    indexes: Vec<ObjectRef>,
-}
-#[derive(Clone, Debug)]
-struct Directory {
-    window_start: u64,
-    base_checkpoint: ObjectRef,
-    epochs: Vec<Epoch>,
-}
-#[derive(Clone, Copy, Debug)]
-struct CheckpointManifest {
-    boundary: u64,
-    partitions: [ObjectRef; ROUTER_PARTITIONS],
-}
-#[derive(Clone, Copy, Debug)]
-struct StatePointer {
-    object: ObjectRef,
-    run_index: u32,
-    version_index: u32,
-}
-#[derive(Clone, Debug)]
-struct CatalogEntry {
-    start: u64,
-    end: u64,
-    directory: ObjectRef,
-}
-#[derive(Clone, Debug)]
-struct CatalogChunk {
-    entries: Vec<CatalogEntry>,
-}
-#[derive(Clone, Debug)]
-struct CatalogRoot {
-    chunks: Vec<(u64, ObjectRef)>,
-}
-#[derive(Clone, Copy, Debug)]
-struct Route {
-    partition: u8,
-    fingerprint: [u8; 12],
-}
-#[derive(Clone, Copy, Debug)]
-struct IndexCandidate {
-    dictionary_index: u8,
-    run_index: u32,
-}
-#[derive(Clone, Debug)]
-struct IndexCandidates {
-    partition: u8,
-    epoch_start: u64,
-    dictionary: Vec<ObjectRef>,
-    candidates: Vec<IndexCandidate>,
-}
-#[derive(Clone, Debug)]
-struct Version {
-    value: Vec<u8>,
-}
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Account {
+    pub exists: bool,
+    pub incarnation: u64,
     pub nonce: u64,
     pub balance: [u8; 32],
-    incarnation: u64,
-    code_hash: [u8; 32],
+    pub code_hash: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RequestStats {
-    pub immutable_gets: u64,
+    pub gets: u64,
     pub fetched_bytes: u64,
-    pub decoded_bytes: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub cache_evictions: u64,
-}
-
-#[derive(Default)]
-struct Budget {
-    gets: u64,
-    fetched: u64,
-    decoded: u64,
-}
-impl Budget {
-    fn reserve_fetch(&mut self, length: usize) -> Result<()> {
-        self.reserve_fetches(std::iter::once(length))
-    }
-    fn reserve_fetches(&mut self, lengths: impl IntoIterator<Item = usize>) -> Result<()> {
-        let (count, bytes) =
-            lengths
-                .into_iter()
-                .try_fold((0u64, 0u64), |(count, bytes), length| -> Result<_> {
-                    Ok((
-                        count.checked_add(1).ok_or(ArchiveError::Limit)?,
-                        bytes
-                            .checked_add(length as u64)
-                            .ok_or(ArchiveError::Limit)?,
-                    ))
-                })?;
-        let gets = self.gets.checked_add(count).ok_or(ArchiveError::Limit)?;
-        let fetched = self.fetched.checked_add(bytes).ok_or(ArchiveError::Limit)?;
-        if gets > MAX_REMOTE_GETS || fetched > MAX_REQUEST_BYTES {
-            return Err(ArchiveError::Limit);
-        }
-        self.gets = gets;
-        self.fetched = fetched;
-        Ok(())
-    }
-    fn decoded(&mut self, length: usize) -> Result<()> {
-        self.decoded = self
-            .decoded
-            .checked_add(length as u64)
-            .ok_or(ArchiveError::Limit)?;
-        if self.decoded > MAX_DECODED_BYTES {
-            return Err(ArchiveError::Limit);
-        }
-        Ok(())
-    }
 }
 
 pub struct Reader<'a, S: ObjectStore> {
     store: &'a S,
     prefix: String,
-    pub commit: Commit,
-    budget: Budget,
-    directory: Option<(u64, u64, Directory)>,
-    cache: HashMap<String, Arc<Vec<u8>>>,
-    cache_order: VecDeque<String>,
-    cache_bytes: usize,
-    cache_hits: u64,
-    cache_misses: u64,
-    cache_evictions: u64,
+    head: Head,
+    runs: Vec<(Run, RunReader)>,
+    gets: Cell<u64>,
+    fetched: Cell<u64>,
+    shards: RefCell<HashMap<String, Rc<Shard>>>,
 }
 
 impl<'a, S: ObjectStore> Reader<'a, S> {
+    /// One request's pinned view. `prefix` ends with `/` (or is empty).
     pub async fn load(store: &'a S, prefix: String, chain_id: u64) -> Result<Self> {
-        let mut budget = Budget::default();
-        let head_key = format!("{prefix}chains/0x{chain_id:x}/heads/finalized.bin");
-        budget.reserve_fetch(HEAD_BYTES)?;
-        let head_bytes = store.get(&head_key, HEAD_BYTES).await?;
-        if head_bytes.len() != HEAD_BYTES {
-            return integrity();
+        let reader = Self {
+            store,
+            head: placeholder_head(),
+            runs: Vec::new(),
+            gets: Cell::new(0),
+            fetched: Cell::new(0),
+            shards: RefCell::new(HashMap::new()),
+            prefix,
+        };
+        let bytes = reader
+            .get(
+                &format!("{}{}", reader.prefix, head_key(chain_id)),
+                MAX_HEAD,
+            )
+            .await?;
+        let head = Head::decode(&bytes)?;
+        if head.chain_id != chain_id {
+            return Err(ArchiveError::Integrity);
         }
-        let head = parse_head(&head_bytes)?;
-        if head.chain_id != chain_id || head.commit.length as usize != COMMIT_BYTES {
-            return integrity();
-        }
-        let commit_bytes =
-            get_verified(store, &prefix, head.commit, COMMIT_BYTES, &mut budget).await?;
-        budget.decoded(COMMIT_BYTES)?;
-        let commit = parse_commit(&commit_bytes)?;
-        if commit.chain_id != chain_id
-            || commit.generation != head.generation
-            || commit.published_number != head.number
-            || commit.published_hash != head.hash
-        {
-            return integrity();
+        let mut runs = Vec::new();
+        for run in head.runs() {
+            let (reference, root) = run.input()?;
+            runs.push((run.clone(), RunReader::decode(reference, &root)?));
         }
         Ok(Self {
-            store,
-            prefix,
-            commit,
-            budget,
-            directory: None,
-            cache: HashMap::new(),
-            cache_order: VecDeque::new(),
-            cache_bytes: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-            cache_evictions: 0,
+            head,
+            runs,
+            ..reader
         })
+    }
+
+    pub fn published_number(&self) -> u64 {
+        self.head.number
     }
 
     pub fn stats(&self) -> RequestStats {
         RequestStats {
-            immutable_gets: self.budget.gets.saturating_sub(1),
-            fetched_bytes: self.budget.fetched,
-            decoded_bytes: self.budget.decoded,
-            cache_hits: self.cache_hits,
-            cache_misses: self.cache_misses,
-            cache_evictions: self.cache_evictions,
+            gets: self.gets.get(),
+            fetched_bytes: self.fetched.get(),
         }
+    }
+
+    async fn get(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        let gets = self.gets.get() + 1;
+        let fetched = self.fetched.get() + maximum as u64;
+        if gets > MAX_REMOTE_GETS || fetched > MAX_REQUEST_BYTES {
+            return Err(ArchiveError::Limit);
+        }
+        self.gets.set(gets);
+        self.fetched.set(fetched);
+        self.store.get(key, maximum).await
+    }
+
+    async fn object(&self, reference: ObjectRef) -> Result<Vec<u8>> {
+        let length = reference.length as usize;
+        if length == 0 || length > MAX_OBJECT_BYTES {
+            return Err(ArchiveError::Integrity);
+        }
+        let key = format!("{}{}", self.prefix, reference.digest.object_key());
+        let bytes = self.get(&key, length).await?;
+        if bytes.len() != length || Hash32::digest(&bytes) != reference.digest {
+            return Err(ArchiveError::Integrity);
+        }
+        Ok(bytes)
+    }
+
+    async fn shard(&self, run: &Run, kind: ShardKind, index: u32) -> Result<Rc<Shard>> {
+        let path = format!(
+            "{}{}",
+            self.prefix,
+            shard_path(run.root.digest, run.shards, kind, index)
+        );
+        if let Some(shard) = self.shards.borrow().get(&path) {
+            return Ok(shard.clone());
+        }
+        let bytes = self.get(&path, MAX_SHARD_BYTES).await?;
+        let shard = Rc::new(Shard::decode(
+            run.root.digest,
+            kind,
+            index,
+            run.shards,
+            &bytes,
+        )?);
+        self.shards.borrow_mut().insert(path, shard.clone());
+        Ok(shard)
+    }
+
+    async fn may_contain(&self, run: &Run, key: &[u8]) -> Result<bool> {
+        let probe = Probe::new(key, run.shards);
+        let address = self
+            .shard(run, ShardKind::Address, probe.address_index)
+            .await?;
+        if address.contains(key) {
+            return Ok(true);
+        }
+        if !address.contains(&probe.marker) {
+            return Ok(false);
+        }
+        Ok(self
+            .shard(run, ShardKind::Spill, probe.spill_index)
+            .await?
+            .contains(key))
+    }
+
+    async fn lookup(&self, key: &[u8], block: u64) -> Result<Option<Vec<u8>>> {
+        for (run, reader) in self.runs.iter().rev() {
+            if run.start > block || !self.may_contain(run, key).await? {
+                continue;
+            }
+            let value = reader
+                .lookup(key, block.min(run.end), |reference| async move {
+                    self.object(reference).await.map_err(anyhow::Error::new)
+                })
+                .await?;
+            if value.is_some() {
+                return Ok(value);
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn account_at(&self, address: [u8; 20], block: u64) -> Result<Option<Account>> {
+        let Some(value) = self.lookup(&account_key(address), block).await? else {
+            return Ok(None);
+        };
+        let state = AccountState::decode(&value)?;
+        Ok(Some(Account {
+            exists: state.exists,
+            incarnation: state.incarnation,
+            nonce: state.nonce,
+            balance: state.balance,
+            code_hash: state.code_hash,
+        })
+        .filter(|account| account.exists))
+    }
+
+    pub async fn storage_at(
+        &self,
+        address: [u8; 20],
+        slot: [u8; 32],
+        block: u64,
+    ) -> Result<[u8; 32]> {
+        let Some(account) = self.account_at(address, block).await? else {
+            return Ok([0; 32]);
+        };
+        match self
+            .lookup(&storage_key(address, account.incarnation, slot), block)
+            .await?
+        {
+            Some(value) => value.try_into().map_err(|_| ArchiveError::Integrity),
+            None => Ok([0; 32]),
+        }
+    }
+
+    pub async fn code_at(&self, address: [u8; 20], block: u64) -> Result<Vec<u8>> {
+        let Some(account) = self.account_at(address, block).await? else {
+            return Ok(Vec::new());
+        };
+        if account.code_hash == EMPTY_CODE_HASH {
+            return Ok(Vec::new());
+        }
+        let bytes = self
+            .lookup(&code_key(account.code_hash), block)
+            .await?
+            .ok_or(ArchiveError::Integrity)?;
+        if bytes.len() > MAX_OBJECT_BYTES
+            || Keccak256::digest(&bytes).as_slice() != account.code_hash
+        {
+            return Err(ArchiveError::Integrity);
+        }
+        Ok(bytes)
     }
 
     pub fn resolve_selector(&self, selector: &serde_json::Value) -> Result<u64> {
@@ -312,9 +264,6 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
                         "invalid EIP-1898 selector".into(),
                     ));
                 }
-                let number = object.get("blockNumber").ok_or_else(|| {
-                    ArchiveError::InvalidParams("block-hash selectors are not supported".into())
-                })?;
                 if object
                     .get("requireCanonical")
                     .is_some_and(|value| !value.is_boolean())
@@ -323,7 +272,9 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
                         "requireCanonical must be boolean".into(),
                     ));
                 }
-                number
+                object.get("blockNumber").ok_or_else(|| {
+                    ArchiveError::InvalidParams("block-hash selectors are not supported".into())
+                })?
             }
             value => value,
         };
@@ -331,21 +282,8 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
             .as_str()
             .ok_or_else(|| ArchiveError::InvalidParams("invalid block selector".into()))?;
         let block = match text {
-            "latest" => self.commit.published_number,
-            "safe" | "finalized" => {
-                if !self.commit.finalized {
-                    return Err(ArchiveError::Unavailable(
-                        "fixed-offset publication is not safe or finalized".into(),
-                    ));
-                }
-                self.commit.published_number
-            }
-            "earliest" if self.commit.anchor_number == 0 => 0,
-            "earliest" => {
-                return Err(ArchiveError::Unavailable(
-                    "earliest is before the archive anchor".into(),
-                ))
-            }
+            "latest" | "safe" | "finalized" => self.head.number,
+            "earliest" => 0,
             "pending" => {
                 return Err(ArchiveError::InvalidParams(
                     "pending is not supported".into(),
@@ -353,1015 +291,70 @@ impl<'a, S: ObjectStore> Reader<'a, S> {
             }
             value => parse_quantity(value)?,
         };
-        if block < self.commit.anchor_number || block > self.commit.published_number {
+        if block > self.head.number {
             return Err(ArchiveError::Unavailable(
                 "block is outside the published archive range".into(),
             ));
         }
         Ok(block)
     }
-
-    fn cache_key(reference: ObjectRef) -> String {
-        format!("{}:{}", hex::encode(reference.digest), reference.length)
-    }
-
-    fn cached_object(&mut self, reference: ObjectRef) -> Result<Option<Arc<Vec<u8>>>> {
-        let key = Self::cache_key(reference);
-        let Some(bytes) = self.cache.get(&key) else {
-            self.cache_misses += 1;
-            return Ok(None);
-        };
-        if bytes.len() != reference.length as usize
-            || Sha256::digest(bytes.as_slice()).as_slice() != reference.digest
-        {
-            return integrity();
-        }
-        self.cache_hits += 1;
-        Ok(Some(bytes.clone()))
-    }
-
-    fn insert_cache(&mut self, reference: ObjectRef, bytes: Arc<Vec<u8>>) {
-        if bytes.len() > CACHE_MAX_ITEM_BYTES {
-            return;
-        }
-        let cache_key = Self::cache_key(reference);
-        if self.cache.contains_key(&cache_key) {
-            return;
-        }
-        while self.cache.len() >= CACHE_MAX_ITEMS
-            || self.cache_bytes + bytes.len() > CACHE_MAX_BYTES
-        {
-            let Some(oldest) = self.cache_order.pop_front() else {
-                break;
-            };
-            if let Some(old) = self.cache.remove(&oldest) {
-                self.cache_bytes -= old.len();
-                self.cache_evictions += 1;
-            }
-        }
-        self.cache_bytes += bytes.len();
-        self.cache_order.push_back(cache_key.clone());
-        self.cache.insert(cache_key, bytes);
-    }
-
-    async fn get_object(&mut self, reference: ObjectRef, maximum: usize) -> Result<Arc<Vec<u8>>> {
-        validate_ref(reference, false)?;
-        if reference.length as usize > maximum {
-            return Err(ArchiveError::Limit);
-        }
-        if let Some(bytes) = self.cached_object(reference)? {
-            return Ok(bytes);
-        }
-        let bytes = Arc::new(
-            get_verified(
-                self.store,
-                &self.prefix,
-                reference,
-                maximum,
-                &mut self.budget,
-            )
-            .await?,
-        );
-        self.insert_cache(reference, bytes.clone());
-        Ok(bytes)
-    }
-
-    async fn get_index_wave(
-        &mut self,
-        references: &[ObjectRef],
-    ) -> Result<Vec<Result<Arc<Vec<u8>>>>> {
-        let mut output = (0..references.len()).map(|_| None).collect::<Vec<_>>();
-        let mut misses = Vec::new();
-        for (position, reference) in references.iter().copied().enumerate() {
-            if let Err(error) = validate_ref(reference, false) {
-                output[position] = Some(Err(error));
-                continue;
-            }
-            if reference.length as usize > MAX_INDEX_BYTES {
-                output[position] = Some(Err(ArchiveError::Limit));
-                continue;
-            }
-            match self.cached_object(reference) {
-                Ok(Some(bytes)) => output[position] = Some(Ok(bytes)),
-                Ok(None) => misses.push((position, reference)),
-                Err(error) => output[position] = Some(Err(error)),
-            }
-        }
-        self.budget.reserve_fetches(
-            misses
-                .iter()
-                .map(|(_, reference)| reference.length as usize),
-        )?;
-        let results = join_all(misses.iter().map(|(_, reference)| {
-            get_verified_reserved(self.store, &self.prefix, *reference, MAX_INDEX_BYTES)
-        }))
-        .await;
-        // Insert oldest-to-newest so FIFO pressure retains the indexes evaluated first.
-        for ((position, reference), result) in misses.into_iter().zip(results).rev() {
-            output[position] = Some(match result {
-                Ok(bytes) => {
-                    let bytes = Arc::new(bytes);
-                    self.insert_cache(reference, bytes.clone());
-                    Ok(bytes)
-                }
-                Err(error) => Err(error),
-            });
-        }
-        output
-            .into_iter()
-            .map(|result| result.ok_or(ArchiveError::Integrity))
-            .collect()
-    }
-
-    async fn ensure_directory(&mut self, block: u64) -> Result<Directory> {
-        if let Some((start, end, directory)) = &self.directory {
-            if *start <= block && block <= *end {
-                return Ok(directory.clone());
-            }
-        }
-        let (directory, start, end) = if block >= self.commit.active_window_start {
-            let bytes = self
-                .get_object(self.commit.active_directory, MAX_DIRECTORY_BYTES)
-                .await?;
-            self.budget.decoded(bytes.len())?;
-            let directory = parse_directory(&bytes)?;
-            if directory.window_start != self.commit.active_window_start
-                || !directory_matches_publication(&directory, self.commit.published_number)
-            {
-                return integrity();
-            }
-            (
-                directory,
-                self.commit.active_window_start,
-                self.commit.published_number,
-            )
-        } else {
-            if self.commit.completed_catalog.empty() {
-                return Err(ArchiveError::Unavailable("block is unavailable".into()));
-            }
-            let bytes = self
-                .get_object(self.commit.completed_catalog, MAX_CATALOG_BYTES)
-                .await?;
-            self.budget.decoded(bytes.len())?;
-            let root = parse_catalog_root(&bytes)?;
-            let position = root.chunks.partition_point(|(start, _)| *start <= block);
-            let index = position
-                .checked_sub(1)
-                .ok_or_else(|| ArchiveError::Unavailable("block is unavailable".into()))?;
-            let chunk_ref = root.chunks[index].1;
-            let bytes = self.get_object(chunk_ref, MAX_CATALOG_BYTES).await?;
-            self.budget.decoded(bytes.len())?;
-            let chunk = parse_catalog_chunk(&bytes)?;
-            let entry = chunk
-                .entries
-                .iter()
-                .find(|entry| entry.start <= block && block <= entry.end)
-                .ok_or_else(|| ArchiveError::Unavailable("block is unavailable".into()))?;
-            let bytes = self
-                .get_object(entry.directory, MAX_DIRECTORY_BYTES)
-                .await?;
-            self.budget.decoded(bytes.len())?;
-            let directory = parse_directory(&bytes)?;
-            let actual_end = directory.epochs.last().ok_or(ArchiveError::Integrity)?.end;
-            if entry.start != directory.window_start || entry.end != actual_end {
-                return integrity();
-            }
-            (directory, entry.start, entry.end)
-        };
-        self.directory = Some((start, end, directory.clone()));
-        Ok(directory)
-    }
-
-    async fn lookup_raw(&mut self, key: &[u8], block: u64) -> Result<Option<Version>> {
-        let directory = self.ensure_directory(block).await?;
-        let route = route_key(key)?;
-        let applicable: Vec<_> = directory
-            .epochs
-            .iter()
-            .rev()
-            .filter(|epoch| epoch.start <= block)
-            .filter_map(|epoch| {
-                let reference = epoch.indexes[route.partition as usize];
-                (!reference.empty()).then_some((epoch, reference))
-            })
-            .collect();
-        for wave in applicable.chunks(INDEX_FETCH_CONCURRENCY) {
-            let references: Vec<_> = wave.iter().map(|(_, reference)| *reference).collect();
-            let indexes = self.get_index_wave(&references).await?;
-            for ((epoch, _), result) in wave.iter().zip(indexes) {
-                let bytes = result?;
-                self.budget.decoded(bytes.len())?;
-                let index = parse_index_candidates(&bytes, route.fingerprint, block)?;
-                if index.partition != route.partition || index.epoch_start != epoch.start {
-                    return integrity();
-                }
-                for entry in index.candidates {
-                    let data_ref = index.dictionary[entry.dictionary_index as usize];
-                    if data_ref != epoch.data[route.partition as usize >> 2] {
-                        return integrity();
-                    }
-                    if data_ref.length as usize > MAX_DATA_OBJECT_BYTES {
-                        return Err(ArchiveError::Limit);
-                    }
-                    let bytes = self.get_object(data_ref, MAX_DATA_OBJECT_BYTES).await?;
-                    if let Some(version) =
-                        parse_data_lookup(&bytes, &mut self.budget, entry.run_index, key, block)?
-                    {
-                        return Ok(Some(version));
-                    }
-                }
-            }
-        }
-        let checkpoint = directory.base_checkpoint;
-        if checkpoint.empty() {
-            return Ok(None);
-        }
-        let bytes = self
-            .get_object(checkpoint, CHECKPOINT_MANIFEST_BYTES)
-            .await?;
-        self.budget.decoded(bytes.len())?;
-        let manifest = parse_checkpoint_manifest(&bytes)?;
-        let expected_boundary = directory
-            .window_start
-            .checked_sub(1)
-            .ok_or(ArchiveError::Integrity)?;
-        if manifest.boundary != expected_boundary {
-            return integrity();
-        }
-        let partition_manifest = manifest.partitions[route.partition as usize];
-        if partition_manifest.empty() {
-            return Ok(None);
-        }
-        let bytes = self
-            .get_object(partition_manifest, MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES)
-            .await?;
-        self.budget.decoded(bytes.len())?;
-        let subshards = parse_checkpoint_partition_manifest(&bytes)?;
-        let subshard = subshards[checkpoint_subshard(key, subshards.len())?];
-        if subshard.empty() {
-            return Ok(None);
-        }
-        let bytes = self
-            .get_object(subshard, MAX_CHECKPOINT_OBJECT_BYTES)
-            .await?;
-        let pointer = parse_checkpoint_lookup(&bytes, &mut self.budget, key)?;
-        drop(bytes);
-        let Some(pointer) = pointer else {
-            return Ok(None);
-        };
-        let bytes = self
-            .get_object(pointer.object, MAX_DATA_OBJECT_BYTES)
-            .await?;
-        parse_data_checkpoint_lookup(&bytes, &mut self.budget, pointer, key, manifest.boundary)
-            .map(Some)
-    }
-
-    pub async fn account_at(&mut self, address: [u8; 20], block: u64) -> Result<Option<Account>> {
-        let mut key = vec![1];
-        key.extend_from_slice(&address);
-        let Some(version) = self.lookup_raw(&key, block).await? else {
-            return Ok(None);
-        };
-        decode_account(&version.value)
-    }
-
-    pub async fn storage_at(
-        &mut self,
-        address: [u8; 20],
-        slot: [u8; 32],
-        block: u64,
-    ) -> Result<[u8; 32]> {
-        let Some(account) = self.account_at(address, block).await? else {
-            return Ok([0; 32]);
-        };
-        let mut key = vec![2];
-        key.extend_from_slice(&address);
-        key.extend_from_slice(&account.incarnation.to_be_bytes());
-        key.extend_from_slice(&slot);
-        match self.lookup_raw(&key, block).await? {
-            Some(version) => decode_storage(&version.value),
-            None => Ok([0; 32]),
-        }
-    }
-
-    pub async fn code_at(&mut self, address: [u8; 20], block: u64) -> Result<Vec<u8>> {
-        let Some(account) = self.account_at(address, block).await? else {
-            return Ok(Vec::new());
-        };
-        if account.code_hash == EMPTY_CODE_HASH {
-            return Ok(Vec::new());
-        }
-        let mut key = vec![3];
-        key.extend_from_slice(&account.code_hash);
-        let version = self
-            .lookup_raw(&key, block)
-            .await?
-            .ok_or(ArchiveError::Integrity)?;
-        let (first_seen, reference) = decode_code_meta(&version.value)?;
-        if first_seen > block {
-            return Ok(Vec::new());
-        }
-        let bytes = self.get_object(reference, MAX_CODE_OBJECT_BYTES).await?;
-        charge_and_verify_code(&bytes, account.code_hash, &mut self.budget)
-    }
 }
 
-async fn get_verified<S: ObjectStore>(
-    store: &S,
-    prefix: &str,
-    reference: ObjectRef,
-    maximum: usize,
-    budget: &mut Budget,
-) -> Result<Vec<u8>> {
-    validate_ref(reference, false)?;
-    if reference.length as usize > maximum {
-        return Err(ArchiveError::Limit);
+/// Stand-in used only while the real head is being fetched.
+fn placeholder_head() -> Head {
+    Head {
+        magic: String::new(),
+        chain_id: 0,
+        genesis: Hash32::default(),
+        number: 0,
+        hash: Hash32::default(),
+        state_root: Hash32::default(),
+        input_sha256: Hash32::default(),
+        parent: None,
+        l0: Vec::new(),
+        levels: Vec::new(),
     }
-    budget.reserve_fetch(reference.length as usize)?;
-    get_verified_reserved(store, prefix, reference, maximum).await
-}
-
-async fn get_verified_reserved<S: ObjectStore>(
-    store: &S,
-    prefix: &str,
-    reference: ObjectRef,
-    maximum: usize,
-) -> Result<Vec<u8>> {
-    validate_ref(reference, false)?;
-    if reference.length as usize > maximum {
-        return Err(ArchiveError::Limit);
-    }
-    let digest = hex::encode(reference.digest);
-    let key = format!("{prefix}objects/sha256/{}/{digest}", &digest[..2]);
-    let bytes = store.get(&key, reference.length as usize).await?;
-    if bytes.len() != reference.length as usize
-        || Sha256::digest(&bytes).as_slice() != reference.digest
-    {
-        return integrity();
-    }
-    Ok(bytes)
-}
-
-fn parse_head(bytes: &[u8]) -> Result<Head> {
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSEH")?;
-    c.version()?;
-    let value = Head {
-        generation: c.u64()?,
-        chain_id: c.u64()?,
-        number: c.u64()?,
-        hash: c.hash()?,
-        commit: c.object_ref()?,
-    };
-    c.end()?;
-    validate_ref(value.commit, false)?;
-    Ok(value)
-}
-
-fn parse_commit(bytes: &[u8]) -> Result<Commit> {
-    if bytes.len() != COMMIT_BYTES {
-        return integrity();
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSEC")?;
-    c.version()?;
-    let generation = c.u64()?;
-    let chain_id = c.u64()?;
-    c.hash()?;
-    let anchor_number = c.u64()?;
-    c.hash()?;
-    let published_hash = c.hash()?;
-    let published_number = c.u64()?;
-    c.hash()?;
-    validate_ref(c.object_ref()?, true)?;
-    let finalized = match c.byte()? {
-        0 => false,
-        1 => true,
-        _ => return integrity(),
-    };
-    c.hash()?;
-    let active_window_start = c.u64()?;
-    let active_directory = c.object_ref()?;
-    validate_ref(active_directory, false)?;
-    let completed_catalog = c.object_ref()?;
-    validate_ref(completed_catalog, true)?;
-    c.end()?;
-    Ok(Commit {
-        generation,
-        chain_id,
-        anchor_number,
-        published_number,
-        finalized,
-        active_window_start,
-        active_directory,
-        completed_catalog,
-        published_hash,
-    })
-}
-
-fn parse_directory(bytes: &[u8]) -> Result<Directory> {
-    if bytes.len() > MAX_DIRECTORY_BYTES {
-        return integrity();
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSER")?;
-    c.version()?;
-    let window_start = c.u64()?;
-    let base_checkpoint = c.object_ref()?;
-    validate_ref(base_checkpoint, true)?;
-    let count = c.byte()? as usize;
-    if count > EPOCHS_PER_WINDOW {
-        return integrity();
-    }
-    let mut epochs = Vec::with_capacity(count);
-    let mut expected = window_start;
-    for _ in 0..count {
-        let start = c.u64()?;
-        let end = c.u64()?;
-        if start != expected || end < start || end - start + 1 > MAX_EPOCH_BLOCKS {
-            return integrity();
-        }
-        validate_ref(c.object_ref()?, false)?;
-        let mut data = Vec::with_capacity(DATA_PARTITIONS);
-        for _ in 0..DATA_PARTITIONS {
-            let r = c.object_ref()?;
-            validate_ref(r, true)?;
-            data.push(r);
-        }
-        let mut indexes = Vec::with_capacity(ROUTER_PARTITIONS);
-        for _ in 0..ROUTER_PARTITIONS {
-            let r = c.object_ref()?;
-            validate_ref(r, true)?;
-            indexes.push(r);
-        }
-        epochs.push(Epoch {
-            start,
-            end,
-            data,
-            indexes,
-        });
-        expected = end.checked_add(1).ok_or(ArchiveError::Integrity)?;
-    }
-    c.end()?;
-    Ok(Directory {
-        window_start,
-        base_checkpoint,
-        epochs,
-    })
-}
-
-fn parse_catalog_root(bytes: &[u8]) -> Result<CatalogRoot> {
-    if bytes.len() > MAX_CATALOG_BYTES {
-        return Err(ArchiveError::Limit);
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSEW")?;
-    c.version()?;
-    let count = c.count(8 + REF_BYTES)?;
-    if count == 0 || count > MAX_CATALOG_CHUNKS {
-        return integrity();
-    }
-    let mut chunks = Vec::with_capacity(count);
-    for _ in 0..count {
-        let start = c.u64()?;
-        let reference = c.object_ref()?;
-        validate_ref(reference, false)?;
-        chunks.push((start, reference));
-    }
-    c.end()?;
-    if !chunks.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-        return integrity();
-    }
-    Ok(CatalogRoot { chunks })
-}
-
-fn parse_catalog_chunk(bytes: &[u8]) -> Result<CatalogChunk> {
-    if bytes.len() > MAX_CATALOG_BYTES {
-        return Err(ArchiveError::Limit);
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSWC")?;
-    c.version()?;
-    let count = c.count(16 + REF_BYTES)?;
-    if count == 0 || count > CATALOG_CHUNK_ENTRIES {
-        return integrity();
-    }
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let entry = CatalogEntry {
-            start: c.u64()?,
-            end: c.u64()?,
-            directory: c.object_ref()?,
-        };
-        validate_ref(entry.directory, false)?;
-        if entry.end < entry.start {
-            return integrity();
-        }
-        entries.push(entry);
-    }
-    c.end()?;
-    if !entries.windows(2).all(|pair| pair[0].end < pair[1].start) {
-        return integrity();
-    }
-    Ok(CatalogChunk { entries })
-}
-
-fn parse_checkpoint_manifest(bytes: &[u8]) -> Result<CheckpointManifest> {
-    if bytes.len() != CHECKPOINT_MANIFEST_BYTES {
-        return integrity();
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSEM")?;
-    c.version()?;
-    let boundary = c.u64()?;
-    let mut partitions = [ObjectRef::default(); ROUTER_PARTITIONS];
-    for reference in &mut partitions {
-        *reference = c.object_ref()?;
-        validate_ref(*reference, true)?;
-    }
-    c.end()?;
-    Ok(CheckpointManifest {
-        boundary,
-        partitions,
-    })
-}
-
-fn parse_checkpoint_partition_manifest(bytes: &[u8]) -> Result<Vec<ObjectRef>> {
-    if bytes.len() > MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES {
-        return Err(ArchiveError::Limit);
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSPS")?;
-    c.version()?;
-    let (count, expected_bytes) = if bytes.len() == LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES {
-        (
-            MIN_CHECKPOINT_SUBSHARDS,
-            LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES,
-        )
-    } else {
-        let count = c.u16()? as usize;
-        validate_checkpoint_subshard_count(count)?;
-        (count, 4 + 1 + 2 + count * REF_BYTES)
-    };
-    if bytes.len() != expected_bytes {
-        return integrity();
-    }
-    let mut subshards = Vec::with_capacity(count);
-    for _ in 0..count {
-        let reference = c.object_ref()?;
-        validate_ref(reference, true)?;
-        subshards.push(reference);
-    }
-    c.end()?;
-    Ok(subshards)
-}
-
-fn validate_index_entry_count(count: usize) -> Result<()> {
-    if count > MAX_INDEX_ENTRIES {
-        Err(ArchiveError::Limit)
-    } else {
-        Ok(())
-    }
-}
-
-fn parse_index_candidates(
-    bytes: &[u8],
-    target_fingerprint: [u8; 12],
-    target_block: u64,
-) -> Result<IndexCandidates> {
-    if bytes.len() > MAX_INDEX_BYTES {
-        return Err(ArchiveError::Limit);
-    }
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSEI")?;
-    c.version()?;
-    let partition = c.byte()?;
-    if partition as usize >= ROUTER_PARTITIONS {
-        return integrity();
-    }
-    let epoch_start = c.u64()?;
-    let dictionary_count = c.count(REF_BYTES)?;
-    if dictionary_count > 4 {
-        return integrity();
-    }
-    let mut dictionary = Vec::with_capacity(dictionary_count);
-    for _ in 0..dictionary_count {
-        let r = c.object_ref()?;
-        validate_ref(r, false)?;
-        dictionary.push(r);
-    }
-    let count = c.count(18)?;
-    validate_index_entry_count(count)?;
-    let mut candidates = Vec::new();
-    let mut prior: Option<([u8; 12], u64, u32)> = None;
-    for _ in 0..count {
-        let fingerprint = c.array::<12>()?;
-        let first_block = epoch_start
-            .checked_add(c.uleb()?)
-            .ok_or(ArchiveError::Integrity)?;
-        let dictionary_index = c.byte()?;
-        let run_index = c.u32()?;
-        if dictionary_index as usize >= dictionary.len() {
-            return integrity();
-        }
-        let ordering = (fingerprint, first_block, run_index);
-        if prior.is_some_and(|prior| prior > ordering) {
-            return integrity();
-        }
-        prior = Some(ordering);
-        if fingerprint == target_fingerprint && first_block <= target_block {
-            if candidates.len() >= MAX_INDEX_CANDIDATES {
-                return Err(ArchiveError::Limit);
-            }
-            candidates.push(IndexCandidate {
-                dictionary_index,
-                run_index,
-            });
-        }
-    }
-    c.end()?;
-    Ok(IndexCandidates {
-        partition,
-        epoch_start,
-        dictionary,
-        candidates,
-    })
-}
-
-fn directory_matches_publication(directory: &Directory, published_number: u64) -> bool {
-    if let Some(epoch) = directory.epochs.last() {
-        epoch.end == published_number
-    } else {
-        published_number
-            .checked_add(1)
-            .is_some_and(|next| next == directory.window_start)
-    }
-}
-
-fn validate_data_lengths(
-    decoded_length: usize,
-    encoded_length: usize,
-    remaining: usize,
-) -> Result<()> {
-    if decoded_length > MAX_DATA_DECODED {
-        return Err(ArchiveError::Limit);
-    }
-    if encoded_length != remaining {
-        return integrity();
-    }
-    Ok(())
-}
-
-fn parse_checkpoint_lookup(
-    bytes: &[u8],
-    budget: &mut Budget,
-    target_key: &[u8],
-) -> Result<Option<StatePointer>> {
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSEP")?;
-    c.version()?;
-    let decoded_length = c.u32()? as usize;
-    let encoded_length = c.u32()? as usize;
-    if decoded_length > MAX_CHECKPOINT_DECODED {
-        return Err(ArchiveError::Limit);
-    }
-    if encoded_length != c.remaining() {
-        return integrity();
-    }
-    budget.decoded(decoded_length)?;
-    let compressed = c.take(encoded_length)?;
-    c.end()?;
-    let decoder = StreamingDecoder::new_with_max_window_size(
-        IoCursor::new(compressed),
-        MAX_CHECKPOINT_DECODED as u64,
-    )
-    .map_err(|_| ArchiveError::Integrity)?;
-    let mut decoded = Vec::with_capacity(decoded_length.min(1024 * 1024));
-    decoder
-        .take(decoded_length as u64 + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|_| ArchiveError::Integrity)?;
-    if decoded.len() != decoded_length {
-        return integrity();
-    }
-
-    // Check the whole shard using borrowed key slices. Canonical producer output is
-    // strictly key-sorted, so duplicate and ordering corruption need no owned map.
-    let mut body = Cursor::new(&decoded);
-    let count = body.count(1 + REF_BYTES + 8)?;
-    let mut prior_key: Option<&[u8]> = None;
-    let mut selected = None;
-    for _ in 0..count {
-        let key = body.bytes()?;
-        if key.is_empty() || prior_key.is_some_and(|prior| prior >= key) {
-            return integrity();
-        }
-        let pointer = StatePointer {
-            object: body.object_ref()?,
-            run_index: body.u32()?,
-            version_index: body.u32()?,
-        };
-        validate_ref(pointer.object, false)?;
-        if key == target_key {
-            selected = Some(pointer);
-        }
-        prior_key = Some(key);
-    }
-    body.end()?;
-    Ok(selected)
-}
-
-fn parse_data_checkpoint_lookup(
-    bytes: &[u8],
-    budget: &mut Budget,
-    pointer: StatePointer,
-    target_key: &[u8],
-    boundary: u64,
-) -> Result<Version> {
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSED")?;
-    c.version()?;
-    let decoded_length = c.u32()? as usize;
-    let encoded_length = c.u32()? as usize;
-    validate_data_lengths(decoded_length, encoded_length, c.remaining())?;
-    budget.decoded(decoded_length)?;
-    let compressed = c.take(encoded_length)?;
-    c.end()?;
-    let decoder = StreamingDecoder::new_with_max_window_size(
-        IoCursor::new(compressed),
-        MAX_DATA_DECODED as u64,
-    )
-    .map_err(|_| ArchiveError::Integrity)?;
-    let mut decoded = Vec::with_capacity(decoded_length.min(1024 * 1024));
-    decoder
-        .take(decoded_length as u64 + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|_| ArchiveError::Integrity)?;
-    if decoded.len() != decoded_length {
-        return integrity();
-    }
-
-    let mut body = Cursor::new(&decoded);
-    let count = body.count(3)?;
-    if pointer.run_index as usize >= count {
-        return integrity();
-    }
-    let mut prior_key: Option<&[u8]> = None;
-    let mut selected: Option<(u64, &[u8])> = None;
-    let mut selected_next_block = None;
-    for run_index in 0..count {
-        let key = body.bytes()?;
-        if key.is_empty() || prior_key.is_some_and(|prior| prior >= key) {
-            return integrity();
-        }
-        let version_count = body.count(2)?;
-        if version_count == 0 {
-            return integrity();
-        }
-        if run_index == pointer.run_index as usize
-            && pointer.version_index as usize >= version_count
-        {
-            return integrity();
-        }
-        let mut block = 0u64;
-        for version_index in 0..version_count {
-            let next = block
-                .checked_add(body.uleb()?)
-                .ok_or(ArchiveError::Integrity)?;
-            if version_index > 0 && next <= block {
-                return integrity();
-            }
-            block = next;
-            let value = body.bytes()?;
-            if run_index == pointer.run_index as usize {
-                if key != target_key {
-                    return integrity();
-                }
-                if version_index == pointer.version_index as usize {
-                    selected = Some((block, value));
-                } else if version_index == pointer.version_index as usize + 1 {
-                    selected_next_block = Some(block);
-                }
-            }
-        }
-        prior_key = Some(key);
-    }
-    body.end()?;
-    let (block, value) = selected.ok_or(ArchiveError::Integrity)?;
-    if block > boundary || selected_next_block.is_some_and(|next| next <= boundary) {
-        return integrity();
-    }
-    Ok(Version {
-        value: value.to_vec(),
-    })
-}
-
-fn parse_data_lookup(
-    bytes: &[u8],
-    budget: &mut Budget,
-    target_run: u32,
-    target_key: &[u8],
-    target_block: u64,
-) -> Result<Option<Version>> {
-    let mut c = Cursor::new(bytes);
-    c.expect(b"FSED")?;
-    c.version()?;
-    let decoded_length = c.u32()? as usize;
-    let encoded_length = c.u32()? as usize;
-    validate_data_lengths(decoded_length, encoded_length, c.remaining())?;
-    budget.decoded(decoded_length)?;
-    let compressed = c.take(encoded_length)?;
-    c.end()?;
-    let decoder = StreamingDecoder::new_with_max_window_size(
-        IoCursor::new(compressed),
-        MAX_DATA_DECODED as u64,
-    )
-    .map_err(|_| ArchiveError::Integrity)?;
-    let mut decoded = Vec::with_capacity(decoded_length.min(1024 * 1024));
-    decoder
-        .take(decoded_length as u64 + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|_| ArchiveError::Integrity)?;
-    if decoded.len() != decoded_length {
-        return integrity();
-    }
-
-    // Keep only borrowed slices while validating the complete body. Peak owned data is
-    // the encoded object, the <=8 MiB decoded buffer, and one selected value clone.
-    let mut body = Cursor::new(&decoded);
-    let count = body.count(3)?;
-    if target_run as usize >= count {
-        return integrity();
-    }
-    let mut prior_key: Option<&[u8]> = None;
-    let mut selected: Option<&[u8]> = None;
-    for run_index in 0..count {
-        let key = body.bytes()?;
-        if key.is_empty() || prior_key.is_some_and(|prior| prior >= key) {
-            return integrity();
-        }
-        let version_count = body.count(2)?;
-        if version_count == 0 {
-            return integrity();
-        }
-        let mut block = 0u64;
-        for version_index in 0..version_count {
-            let next = block
-                .checked_add(body.uleb()?)
-                .ok_or(ArchiveError::Integrity)?;
-            if version_index > 0 && next <= block {
-                return integrity();
-            }
-            block = next;
-            let value = body.bytes()?;
-            if run_index == target_run as usize && key == target_key && block <= target_block {
-                selected = Some(value);
-            }
-        }
-        prior_key = Some(key);
-    }
-    body.end()?;
-    Ok(selected.map(|value| Version {
-        value: value.to_vec(),
-    }))
-}
-
-fn charge_and_verify_code(
-    bytes: &[u8],
-    expected_hash: [u8; 32],
-    budget: &mut Budget,
-) -> Result<Vec<u8>> {
-    budget.decoded(bytes.len())?;
-    if Keccak256::digest(bytes).as_slice() != expected_hash {
-        return integrity();
-    }
-    Ok(bytes.to_vec())
-}
-
-fn decode_account(bytes: &[u8]) -> Result<Option<Account>> {
-    let mut c = Cursor::new(bytes);
-    let exists = c.byte()?;
-    if exists > 1 {
-        return integrity();
-    }
-    let incarnation = c.uleb()?;
-    let nonce = c.uleb()?;
-    let balance = c.trimmed_u256()?;
-    let code_hash = c.hash()?;
-    c.end()?;
-    Ok((exists == 1).then_some(Account {
-        nonce,
-        balance,
-        incarnation,
-        code_hash,
-    }))
-}
-fn decode_storage(bytes: &[u8]) -> Result<[u8; 32]> {
-    let mut c = Cursor::new(bytes);
-    let value = c.trimmed_u256()?;
-    c.end()?;
-    Ok(value)
-}
-fn decode_code_meta(bytes: &[u8]) -> Result<(u64, ObjectRef)> {
-    let mut c = Cursor::new(bytes);
-    let first_seen = c.u64()?;
-    let object = c.object_ref()?;
-    validate_ref(object, false)?;
-    if object.length as usize > MAX_CODE_OBJECT_BYTES {
-        return integrity();
-    }
-    c.end()?;
-    Ok((first_seen, object))
-}
-
-fn validate_checkpoint_subshard_count(count: usize) -> Result<()> {
-    if !(MIN_CHECKPOINT_SUBSHARDS..=MAX_CHECKPOINT_SUBSHARDS).contains(&count)
-        || !count.is_power_of_two()
-    {
-        return integrity();
-    }
-    Ok(())
-}
-
-fn checkpoint_subshard(key: &[u8], count: usize) -> Result<usize> {
-    validate_checkpoint_subshard_count(count)?;
-    let full = Sha256::digest(key);
-    Ok(full[12] as usize >> (8 - count.trailing_zeros() as usize))
-}
-
-fn route_key(key: &[u8]) -> Result<Route> {
-    let full = Sha256::digest(key);
-    let route = match key.first() {
-        Some(1 | 2) if key.len() >= 21 => Sha256::digest(&key[1..21]),
-        Some(3) if key.len() > 1 => Sha256::digest(&key[1..]),
-        _ => return integrity(),
-    };
-    let mut fingerprint = [0; 12];
-    fingerprint.copy_from_slice(&full[..12]);
-    Ok(Route {
-        partition: route[0] >> 1,
-        fingerprint,
-    })
-}
-fn validate_ref(reference: ObjectRef, optional: bool) -> Result<()> {
-    if optional && reference.empty() {
-        return Ok(());
-    }
-    if reference.length == 0 || reference.digest == [0; 32] {
-        return integrity();
-    }
-    Ok(())
 }
 
 pub fn parse_address(value: &serde_json::Value) -> Result<[u8; 20]> {
-    let text = value
-        .as_str()
-        .ok_or_else(|| ArchiveError::InvalidParams("address must be 20-byte hex data".into()))?;
+    let invalid = || ArchiveError::InvalidParams("address must be 20-byte hex data".into());
+    let text = value.as_str().ok_or_else(invalid)?;
     if text.len() != 42 || !text.starts_with("0x") {
-        return Err(ArchiveError::InvalidParams(
-            "address must be 20-byte hex data".into(),
-        ));
+        return Err(invalid());
     }
-    let bytes = hex::decode(&text[2..])
-        .map_err(|_| ArchiveError::InvalidParams("address must be 20-byte hex data".into()))?;
-    bytes
+    hex::decode(&text[2..])
+        .map_err(|_| invalid())?
         .try_into()
-        .map_err(|_| ArchiveError::InvalidParams("address must be 20-byte hex data".into()))
+        .map_err(|_| invalid())
 }
 pub fn parse_slot(value: &serde_json::Value) -> Result<[u8; 32]> {
-    let text = value.as_str().ok_or_else(|| {
-        ArchiveError::InvalidParams("slot must be at most 32 bytes of hex".into())
-    })?;
+    let invalid = || ArchiveError::InvalidParams("slot must be at most 32 bytes of hex".into());
+    let text = value.as_str().ok_or_else(invalid)?;
     if !text.starts_with("0x")
         || text.len() < 3
         || text.len() > 66
         || !text[2..].bytes().all(|b| b.is_ascii_hexdigit())
     {
-        return Err(ArchiveError::InvalidParams(
-            "slot must be at most 32 bytes of hex".into(),
-        ));
+        return Err(invalid());
     }
     let mut digits = text[2..].to_string();
     if digits.len() % 2 == 1 {
         digits.insert(0, '0');
     }
-    let bytes = hex::decode(digits)
-        .map_err(|_| ArchiveError::InvalidParams("slot must be at most 32 bytes of hex".into()))?;
+    let bytes = hex::decode(digits).map_err(|_| invalid())?;
     let mut out = [0; 32];
     out[32 - bytes.len()..].copy_from_slice(&bytes);
     Ok(out)
 }
 pub fn parse_quantity(value: &str) -> Result<u64> {
-    let digits = value.strip_prefix("0x").ok_or_else(|| {
-        ArchiveError::InvalidParams("block number must be a canonical hex quantity".into())
-    })?;
+    let invalid =
+        || ArchiveError::InvalidParams("block number must be a canonical hex quantity".into());
+    let digits = value.strip_prefix("0x").ok_or_else(invalid)?;
     if digits.is_empty()
         || (digits.len() > 1 && digits.starts_with('0'))
         || !digits.bytes().all(|b| b.is_ascii_hexdigit())
     {
-        return Err(ArchiveError::InvalidParams(
-            "block number must be a canonical hex quantity".into(),
-        ));
+        return Err(invalid());
     }
     u64::from_str_radix(digits, 16)
         .map_err(|_| ArchiveError::InvalidParams("block number exceeds u64".into()))
@@ -1372,453 +365,4 @@ pub fn quantity(value: u64) -> String {
 pub fn quantity_bytes(value: &[u8; 32]) -> String {
     let text = hex::encode(value).trim_start_matches('0').to_owned();
     format!("0x{}", if text.is_empty() { "0" } else { &text })
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.offset
-    }
-    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or(ArchiveError::Integrity)?;
-        if end > self.bytes.len() {
-            return integrity();
-        }
-        let out = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(out)
-    }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| ArchiveError::Integrity)
-    }
-    fn expect(&mut self, expected: &[u8]) -> Result<()> {
-        if self.take(expected.len())? != expected {
-            return integrity();
-        }
-        Ok(())
-    }
-    fn version(&mut self) -> Result<()> {
-        if self.byte()? != VERSION {
-            return integrity();
-        }
-        Ok(())
-    }
-    fn byte(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_be_bytes(self.array()?))
-    }
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_be_bytes(self.array()?))
-    }
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_be_bytes(self.array()?))
-    }
-    fn hash(&mut self) -> Result<[u8; 32]> {
-        self.array()
-    }
-    fn object_ref(&mut self) -> Result<ObjectRef> {
-        Ok(ObjectRef {
-            digest: self.hash()?,
-            length: self.u32()?,
-        })
-    }
-    fn uleb(&mut self) -> Result<u64> {
-        let start = self.offset;
-        let mut result = 0u64;
-        for shift in (0..=63).step_by(7) {
-            let byte = self.byte()?;
-            if shift == 63 && byte > 1 {
-                return integrity();
-            }
-            result |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
-                let mut encoded = Vec::new();
-                put_uleb(&mut encoded, result);
-                if self.bytes[start..self.offset] != encoded {
-                    return integrity();
-                }
-                return Ok(result);
-            }
-        }
-        integrity()
-    }
-    fn count(&mut self, minimum: usize) -> Result<usize> {
-        let count = usize::try_from(self.uleb()?).map_err(|_| ArchiveError::Integrity)?;
-        if count > self.remaining() / minimum {
-            return integrity();
-        }
-        Ok(count)
-    }
-    fn bytes(&mut self) -> Result<&'a [u8]> {
-        let count = usize::try_from(self.uleb()?).map_err(|_| ArchiveError::Integrity)?;
-        self.take(count)
-    }
-    fn trimmed_u256(&mut self) -> Result<[u8; 32]> {
-        let length = self.byte()? as usize;
-        if length > 32 {
-            return integrity();
-        }
-        let bytes = self.take(length)?;
-        if bytes.first() == Some(&0) {
-            return integrity();
-        }
-        let mut out = [0; 32];
-        out[32 - length..].copy_from_slice(bytes);
-        Ok(out)
-    }
-    fn end(&self) -> Result<()> {
-        if self.remaining() != 0 {
-            return integrity();
-        }
-        Ok(())
-    }
-}
-fn put_uleb(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::executor::block_on;
-    use std::cell::Cell;
-
-    struct CountingStore(Cell<usize>);
-    impl ObjectStore for CountingStore {
-        async fn get(&self, _key: &str, _maximum: usize) -> Result<Vec<u8>> {
-            self.0.set(self.0.get() + 1);
-            Err(ArchiveError::Unavailable("missing".into()))
-        }
-    }
-
-    fn reader(store: &CountingStore) -> Reader<'_, CountingStore> {
-        Reader {
-            store,
-            prefix: "fixture/".into(),
-            commit: Commit {
-                generation: 1,
-                chain_id: 1,
-                anchor_number: 0,
-                published_number: 0,
-                finalized: true,
-                active_window_start: 0,
-                active_directory: ObjectRef {
-                    digest: [1; 32],
-                    length: 1,
-                },
-                completed_catalog: ObjectRef::default(),
-                published_hash: [2; 32],
-            },
-            budget: Budget::default(),
-            directory: None,
-            cache: HashMap::new(),
-            cache_order: VecDeque::new(),
-            cache_bytes: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-            cache_evictions: 0,
-        }
-    }
-
-    #[test]
-    fn worker_data_caps_have_checked_boundaries_and_reject_before_get() {
-        assert_eq!(MAX_DATA_DECODED, 8 * 1024 * 1024);
-        assert_eq!(MAX_DATA_OBJECT_BYTES, MAX_DATA_DECODED + 256 * 1024);
-        assert!(validate_data_lengths(MAX_DATA_DECODED, 12, 12).is_ok());
-        assert_eq!(
-            validate_data_lengths(MAX_DATA_DECODED + 1, 0, 0),
-            Err(ArchiveError::Limit)
-        );
-
-        block_on(async {
-            let store = CountingStore(Cell::new(0));
-            let mut bounded_reader = reader(&store);
-            let oversized = ObjectRef {
-                digest: [3; 32],
-                length: (MAX_DATA_OBJECT_BYTES + 1) as u32,
-            };
-            assert_eq!(
-                bounded_reader
-                    .get_object(oversized, MAX_DATA_OBJECT_BYTES)
-                    .await,
-                Err(ArchiveError::Limit)
-            );
-            assert_eq!(store.0.get(), 0);
-
-            let boundary = ObjectRef {
-                digest: [4; 32],
-                length: MAX_DATA_OBJECT_BYTES as u32,
-            };
-            assert!(matches!(
-                bounded_reader
-                    .get_object(boundary, MAX_DATA_OBJECT_BYTES)
-                    .await,
-                Err(ArchiveError::Unavailable(_))
-            ));
-            assert_eq!(store.0.get(), 1);
-
-            let exhausted_store = CountingStore(Cell::new(0));
-            let mut exhausted = reader(&exhausted_store);
-            exhausted.budget.fetched = MAX_REQUEST_BYTES;
-            let small = ObjectRef {
-                digest: [5; 32],
-                length: 1,
-            };
-            assert_eq!(
-                exhausted.get_object(small, MAX_DATA_OBJECT_BYTES).await,
-                Err(ArchiveError::Limit)
-            );
-            assert_eq!(exhausted_store.0.get(), 0);
-
-            let checkpoint_store = CountingStore(Cell::new(0));
-            let mut checkpoint_reader = reader(&checkpoint_store);
-            let oversized_checkpoint = ObjectRef {
-                digest: [8; 32],
-                length: (MAX_CHECKPOINT_OBJECT_BYTES + 1) as u32,
-            };
-            assert_eq!(
-                checkpoint_reader
-                    .get_object(oversized_checkpoint, MAX_CHECKPOINT_OBJECT_BYTES)
-                    .await,
-                Err(ArchiveError::Limit)
-            );
-            assert_eq!(checkpoint_store.0.get(), 0);
-        });
-    }
-
-    #[test]
-    fn adaptive_checkpoint_manifest_count_and_routing_fail_closed() {
-        let key = [0x5au8; 21];
-        let shard8 = checkpoint_subshard(&key, 8).unwrap();
-        let shard16 = checkpoint_subshard(&key, 16).unwrap();
-        let shard256 = checkpoint_subshard(&key, 256).unwrap();
-        assert_eq!(shard16 >> 1, shard8);
-        assert_eq!(shard256 >> 5, shard8);
-        assert_eq!(checkpoint_subshard(&key, 12), Err(ArchiveError::Integrity));
-
-        let mut manifest = b"FSPS".to_vec();
-        manifest.push(VERSION);
-        manifest.extend_from_slice(&8u16.to_be_bytes());
-        manifest.extend_from_slice(&vec![0; 8 * REF_BYTES]);
-        assert_eq!(
-            parse_checkpoint_partition_manifest(&manifest)
-                .unwrap()
-                .len(),
-            8
-        );
-        let mut legacy = b"FSPS".to_vec();
-        legacy.push(VERSION);
-        legacy.extend_from_slice(&vec![0; 8 * REF_BYTES]);
-        assert_eq!(legacy.len(), LEGACY_CHECKPOINT_PARTITION_MANIFEST_BYTES);
-        assert_eq!(legacy.len(), 293);
-        assert_eq!(
-            parse_checkpoint_partition_manifest(&legacy).unwrap().len(),
-            8
-        );
-
-        manifest[5..7].copy_from_slice(&12u16.to_be_bytes());
-        assert_eq!(
-            parse_checkpoint_partition_manifest(&manifest),
-            Err(ArchiveError::Integrity)
-        );
-        assert_eq!(
-            parse_checkpoint_partition_manifest(&vec![
-                0;
-                MAX_CHECKPOINT_PARTITION_MANIFEST_BYTES + 1
-            ]),
-            Err(ArchiveError::Limit)
-        );
-    }
-
-    fn index_with_candidates(count: usize) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"FSEI");
-        bytes.push(VERSION);
-        bytes.push(0);
-        bytes.extend_from_slice(&0u64.to_be_bytes());
-        put_uleb(&mut bytes, 1);
-        bytes.extend_from_slice(&[9; 32]);
-        bytes.extend_from_slice(&1u32.to_be_bytes());
-        put_uleb(&mut bytes, count as u64);
-        for run_index in 0..count {
-            bytes.extend_from_slice(&[7; 12]);
-            put_uleb(&mut bytes, 0);
-            bytes.push(0);
-            bytes.extend_from_slice(&(run_index as u32).to_be_bytes());
-        }
-        bytes
-    }
-
-    #[test]
-    fn worker_index_cap_and_candidate_cpu_bounds_fail_closed() {
-        block_on(async {
-            let store = CountingStore(Cell::new(0));
-            let mut bounded_reader = reader(&store);
-            let oversized = ObjectRef {
-                digest: [6; 32],
-                length: (MAX_INDEX_BYTES + 1) as u32,
-            };
-            assert_eq!(
-                bounded_reader.get_object(oversized, MAX_INDEX_BYTES).await,
-                Err(ArchiveError::Limit)
-            );
-            assert_eq!(store.0.get(), 0);
-
-            let boundary = ObjectRef {
-                digest: [7; 32],
-                length: MAX_INDEX_BYTES as u32,
-            };
-            assert!(matches!(
-                bounded_reader.get_object(boundary, MAX_INDEX_BYTES).await,
-                Err(ArchiveError::Unavailable(_))
-            ));
-            assert_eq!(store.0.get(), 1);
-        });
-
-        assert!(validate_index_entry_count(MAX_INDEX_ENTRIES).is_ok());
-        assert_eq!(
-            validate_index_entry_count(MAX_INDEX_ENTRIES + 1),
-            Err(ArchiveError::Limit)
-        );
-        assert!(matches!(
-            parse_index_candidates(&index_with_candidates(MAX_INDEX_CANDIDATES + 1), [7; 12], 0),
-            Err(ArchiveError::Limit)
-        ));
-        assert_eq!(
-            parse_index_candidates(&index_with_candidates(MAX_INDEX_CANDIDATES), [7; 12], 0)
-                .unwrap()
-                .candidates
-                .len(),
-            MAX_INDEX_CANDIDATES
-        );
-    }
-
-    #[test]
-    fn request_cache_tracks_verified_hits_misses_and_fifo_eviction() {
-        let store = CountingStore(Cell::new(0));
-        let mut reader = reader(&store);
-        let mut references = Vec::new();
-        for value in 0..=CACHE_MAX_ITEMS {
-            let bytes = vec![value as u8];
-            let reference = ObjectRef {
-                digest: Sha256::digest(&bytes).into(),
-                length: 1,
-            };
-            reader.insert_cache(reference, Arc::new(bytes));
-            references.push(reference);
-        }
-        assert_eq!(reader.cache.len(), CACHE_MAX_ITEMS);
-        assert_eq!(reader.cache_evictions, 1);
-        assert!(reader.cached_object(references[0]).unwrap().is_none());
-        assert_eq!(
-            reader.cached_object(*references.last().unwrap()).unwrap(),
-            Some(Arc::new(vec![CACHE_MAX_ITEMS as u8]))
-        );
-        assert_eq!((reader.cache_hits, reader.cache_misses), (1, 1));
-
-        let newest = *references.last().unwrap();
-        Arc::get_mut(
-            reader
-                .cache
-                .get_mut(&Reader::<CountingStore>::cache_key(newest))
-                .unwrap(),
-        )
-        .unwrap()[0] ^= 1;
-        assert_eq!(reader.cached_object(newest), Err(ArchiveError::Integrity));
-    }
-
-    #[test]
-    fn fetched_bytes_are_reserved_atomically_before_io() {
-        let mut head_budget = Budget::default();
-        assert!(head_budget.reserve_fetch(HEAD_BYTES).is_ok());
-        assert_eq!(
-            (head_budget.gets, head_budget.fetched),
-            (1, HEAD_BYTES as u64)
-        );
-
-        let mut budget = Budget {
-            gets: 7,
-            fetched: MAX_REQUEST_BYTES - 4,
-            decoded: 0,
-        };
-        assert_eq!(budget.reserve_fetch(5), Err(ArchiveError::Limit));
-        assert_eq!((budget.gets, budget.fetched), (7, MAX_REQUEST_BYTES - 4));
-        assert!(budget.reserve_fetch(4).is_ok());
-        assert_eq!((budget.gets, budget.fetched), (8, MAX_REQUEST_BYTES));
-
-        let mut wave_budget = Budget {
-            gets: MAX_REMOTE_GETS - 1,
-            fetched: 0,
-            decoded: 0,
-        };
-        assert_eq!(
-            wave_budget.reserve_fetches([1, 1]),
-            Err(ArchiveError::Limit)
-        );
-        assert_eq!(
-            (wave_budget.gets, wave_budget.fetched),
-            (MAX_REMOTE_GETS - 1, 0)
-        );
-    }
-
-    #[test]
-    fn code_is_charged_before_keccak_and_account_tombstones_preserve_incarnation_codec() {
-        let mut budget = Budget {
-            gets: 0,
-            fetched: 0,
-            decoded: MAX_DECODED_BYTES,
-        };
-        assert_eq!(
-            charge_and_verify_code(&[0xaa], [0; 32], &mut budget),
-            Err(ArchiveError::Limit)
-        );
-
-        let mut live = vec![1, 7, 3, 0];
-        live.extend_from_slice(&EMPTY_CODE_HASH);
-        let account = decode_account(&live).unwrap().unwrap();
-        assert_eq!(account.incarnation, 7);
-        assert_eq!(account.nonce, 3);
-
-        live[0] = 0;
-        assert!(decode_account(&live).unwrap().is_none());
-    }
-
-    #[test]
-    fn empty_directory_requires_checked_published_successor() {
-        let empty = Directory {
-            window_start: 11,
-            base_checkpoint: ObjectRef::default(),
-            epochs: vec![],
-        };
-        assert!(directory_matches_publication(&empty, 10));
-        let wrapped = Directory {
-            window_start: 0,
-            base_checkpoint: ObjectRef::default(),
-            epochs: vec![],
-        };
-        assert!(!directory_matches_publication(&wrapped, u64::MAX));
-    }
 }

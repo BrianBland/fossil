@@ -1,57 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 
 pub const SCHEMA: &str = "fossil-export/1";
 pub const SEGMENT_SCHEMA: &str = "fossil-segment/1";
 pub const ZERO_HASH: Hash32 = Hash32([0; 32]);
 
-#[derive(
-    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(try_from = "String", into = "String")]
-pub struct Hash32(pub [u8; 32]);
-
-impl Hash32 {
-    pub fn digest(bytes: &[u8]) -> Self {
-        let digest = Sha256::digest(bytes);
-        let mut value = [0; 32];
-        value.copy_from_slice(&digest);
-        Self(value)
-    }
-
-    pub fn object_key(self) -> String {
-        let hex = hex::encode(self.0);
-        format!("objects/sha256/{}/{}", &hex[..2], hex)
-    }
-}
-
-impl fmt::Display for Hash32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{}", hex::encode(self.0))
-    }
-}
-
-impl From<Hash32> for String {
-    fn from(value: Hash32) -> Self {
-        value.to_string()
-    }
-}
-
-impl TryFrom<String> for Hash32 {
-    type Error = anyhow::Error;
-    fn try_from(value: String) -> Result<Self> {
-        parse_fixed::<32>(&value).map(Self)
-    }
-}
-
-impl FromStr for Hash32 {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        parse_fixed::<32>(s).map(Self)
-    }
-}
+pub use fossil_codec::Hash32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

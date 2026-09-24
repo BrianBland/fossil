@@ -5,7 +5,6 @@ pub mod compact;
 pub mod format;
 pub mod normalized;
 pub mod rpc;
-pub mod run;
 pub mod store;
-pub mod summary;
 pub mod tiered;
+pub use fossil_codec::{run, summary};

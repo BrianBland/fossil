@@ -11,7 +11,7 @@
 //! reader needs no directory GET. Each shard binds its run digest, kind, index
 //! and shard count, and ends with a SHA-256 of its preceding bytes.
 
-use crate::format::Hash32;
+use crate::Hash32;
 use anyhow::{bail, Result};
 
 const MAGIC: &[u8; 4] = b"FTSM";
@@ -266,7 +266,7 @@ impl Probe {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "build"))]
 mod tests {
     use super::*;
 

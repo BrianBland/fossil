@@ -6,10 +6,12 @@
 //! at most one data page. Builder memory is bounded by one fence leaf and one
 //! parent index per partition.
 
-use crate::format::Hash32;
+use crate::Hash32;
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(feature = "build")]
+use std::io::Write;
 
 const ROOT_MAGIC: &[u8; 4] = b"FTRT";
 const INDEX_MAGIC: &[u8; 4] = b"FTIX";
@@ -59,9 +61,11 @@ struct Fence {
     data: ObjectRef,
 }
 
+#[cfg(feature = "build")]
 /// Stateful bounded streaming builder. Input must be strictly sorted by `(key, block)`.
 pub struct RunBuilder;
 
+#[cfg(feature = "build")]
 impl RunBuilder {
     /// Encode sorted records, emitting immutable data/fence/root objects in dependency order.
     /// Only data-page buffers, current fence leaves, and capped parent indexes are retained.
@@ -431,6 +435,7 @@ fn partition(key: &[u8]) -> usize {
     (Hash32::digest(key).0[0] >> 4) as usize
 }
 
+#[cfg(feature = "build")]
 fn data_page_start() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4096);
     bytes.extend_from_slice(DATA_MAGIC);
@@ -439,6 +444,7 @@ fn data_page_start() -> Vec<u8> {
     bytes
 }
 
+#[cfg(feature = "build")]
 fn encode_record(record: &Record) -> Result<Vec<u8>> {
     let key_len = u32::try_from(record.key.len()).context("run key too long")?;
     let value_len = u32::try_from(record.value.len()).context("run value too long")?;
@@ -451,6 +457,7 @@ fn encode_record(record: &Record) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "build")]
 fn flush_page<F>(
     partition: usize,
     pages: &mut [Vec<u8>; PARTITIONS],
@@ -500,6 +507,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "build")]
 fn append_leaf_fence<F>(
     partition: usize,
     fence: Fence,
@@ -526,6 +534,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "build")]
 fn emit_leaf<F>(
     partition: usize,
     leaves: &mut [Vec<Fence>; PARTITIONS],
@@ -563,6 +572,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "build")]
 fn decode_first_record(page: &[u8]) -> Result<Record> {
     let records = parse_data_payload(page, None)?;
     records
@@ -624,6 +634,7 @@ fn decode_data_page(reference: ObjectRef, bytes: &[u8], shard: usize) -> Result<
     parse_data_payload(&decoded, Some(shard))
 }
 
+#[cfg(feature = "build")]
 fn index_size(entries: &[Fence]) -> Result<usize> {
     let mut size = 9_usize;
     for fence in entries {
@@ -634,6 +645,7 @@ fn index_size(entries: &[Fence]) -> Result<usize> {
     Ok(size)
 }
 
+#[cfg(feature = "build")]
 fn encode_index(entries: &[Fence], magic: &[u8; 4]) -> Result<Vec<u8>> {
     let size = index_size(entries)?;
     if size > MAX_INDEX_BYTES {
@@ -735,8 +747,11 @@ fn decode_compressed(reference: ObjectRef, bytes: &[u8], maximum: usize) -> Resu
     }
     let mut decoded = Vec::new();
     decoded.try_reserve_exact(decoded_len)?;
-    let mut decoder = zstd::Decoder::new(&bytes[13..])?;
-    decoder.window_log_max(20)?;
+    // Pure-Rust decoder so wasm readers share this path; the window is capped at
+    // the page bound, matching the builder's 2^20 window.
+    let decoder =
+        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(&bytes[13..], maximum as u64)
+            .map_err(|error| anyhow::anyhow!("invalid zstd run page: {error}"))?;
     decoder
         .take((maximum + 1) as u64)
         .read_to_end(&mut decoded)?;
@@ -746,6 +761,7 @@ fn decode_compressed(reference: ObjectRef, bytes: &[u8], maximum: usize) -> Resu
     Ok(decoded)
 }
 
+#[cfg(feature = "build")]
 fn make_object(bytes: Vec<u8>) -> Result<EncodedObject> {
     let length = u32::try_from(bytes.len()).context("run object exceeds u32 reference length")?;
     Ok(EncodedObject {
@@ -764,6 +780,7 @@ fn verify_object(reference: ObjectRef, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "build")]
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let length = u32::try_from(bytes.len()).context("run key exceeds u32 length")?;
     out.extend_from_slice(&length.to_be_bytes());
@@ -771,6 +788,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "build")]
 fn put_ref(out: &mut Vec<u8>, reference: ObjectRef) {
     out.extend_from_slice(&reference.digest.0);
     out.extend_from_slice(&reference.length.to_be_bytes());
@@ -813,7 +831,7 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
     Ok(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "build"))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
