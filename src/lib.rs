@@ -1,6 +1,11 @@
 pub mod archive;
 pub mod benchmark;
+pub mod bootstrap;
+pub mod compact;
 pub mod format;
 pub mod normalized;
 pub mod rpc;
+pub mod run;
 pub mod store;
+pub mod summary;
+pub mod tiered;

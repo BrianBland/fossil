@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use fossil::archive::{load_head_commit, publish, Publication, PublicationGate};
+use fossil::bootstrap::genesis_anchor;
 use fossil::format::{parse_quantity, Hash32};
 use fossil::normalized::read_package;
 use fossil::rpc::{serve, serve_refreshing};
@@ -21,6 +22,8 @@ struct Cli {
 enum Command {
     /// Validate a normalized export and atomically publish eligible state.
     Archive(ArchiveArgs),
+    /// Build a complete block-zero export package from a genesis allocation.
+    Anchor(AnchorArgs),
     /// Serve the committed archive through a small Ethereum JSON-RPC surface.
     Serve(ServeArgs),
     /// Verify the committed head and commit. Lazy objects verify when read.
@@ -42,6 +45,19 @@ struct StoreArgs {
     /// Chain ID as a canonical Ethereum quantity.
     #[arg(long, default_value = "0x2105")]
     chain_id: String,
+}
+
+#[derive(Args)]
+struct AnchorArgs {
+    /// Chain genesis JSON containing the exhaustive allocation.
+    #[arg(long)]
+    genesis: PathBuf,
+    /// Canonical block-zero JSON-RPC response or block object.
+    #[arg(long)]
+    block: PathBuf,
+    /// Normalized fossil-export/1 JSONL destination.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(Args)]
@@ -109,6 +125,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Archive(args) => archive(args).await,
+        Command::Anchor(args) => {
+            let genesis = std::fs::read(&args.genesis).context("read genesis allocation")?;
+            let block = std::fs::read(&args.block).context("read canonical block zero")?;
+            let package = genesis_anchor(&genesis, &block)?;
+            std::fs::write(&args.output, package).context("write genesis anchor")?;
+            Ok(())
+        }
         Command::Serve(args) => run_server(args).await,
         Command::Verify(args) => verify(args).await,
         Command::Benchmark(args) => benchmark(args).await,

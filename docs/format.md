@@ -1,140 +1,37 @@
 # Fossil storage format version 1
 
-This is the initial Fossil on-disk format. Every binary object carries schema version
-1. There is one mutable head, `chains/<chain-id>/heads/finalized.bin`, and one
-immutable object namespace. Readers do not probe alternate keys or formats.
+Fossil archives complete EVM post-state history in immutable objects. One mutable JSON head, `chains/<chain-id>/heads/tiered-v1.json` (at most 256 KiB), is updated with compare-and-swap after every referenced object has been uploaded. The head carries the finalized block, canonical hash, state root, input digest, the complete run manifest inline, and a reference to an immutable copy of the head it replaced, so a cold reader needs exactly one GET before probing runs. An object reference contains its SHA-256 digest and exact encoded length. Readers verify both before decoding.
 
-The layout uses 128 router/checkpoint partitions, 32 epoch data partitions, adaptive
-power-of-two checkpoint subsharding (8 through 256 subshards per primary partition),
-epochs of at most 1,000 blocks, and windows of 64 sealed epoch descriptors. The
-immutable references make this object hierarchy a
-[Merkle DAG rooted at the commit digest](integrity.md).
-
-## Head and commit
-
-The binary mutable head identifies one fixed-size immutable commit. The commit has
-constant size and contains chain, anchor, published-head, finality, input, audit-parent,
-active-window-directory, and completed-window-catalog metadata. Ordinary startup is
-exactly head plus commit. The audit parent is validated as a reference but never
-traversed by startup or queries.
-
-All immutable references contain SHA-256 and exact byte length. Before buffering,
-readers reject reference lengths over the object-type bound and require filesystem,
-memory, or provider metadata to fit the bound; provider metadata and returned length
-must agree. Bytes are then checked against the exact reference before parsing. The
-commit reference must equal the fixed commit size. The fixed-size mutable format head also
-uses a bounded read: filesystem reads stop at `max+1`, and object-store streams abort
-as soon as accumulated bytes exceed the cap even if metadata underreports. Decoders
-reject bad magic/version,
-trailing bytes, invalid references, noncanonical ULEB128/U256, zero-version runs,
-impossible allocation counts, unsorted keys/versions, and out-of-range offsets.
-
-## Sealed epochs
-
-A producer buffers a maximum 1,000 contiguous blocks and publishes only the sealed
-epoch; no open epoch is mutable or visible. The first exhaustive anchor is a special
-sealed epoch/checkpoint. Within an epoch, changes are grouped by exact logical key and
-versions are block-delta encoded in ascending order. Account tombstones, explicit
-zero storage, and incarnations retain their existing semantics. Code bytes remain
-separate deduplicated CAS objects with a documented 1 MiB prototype hard limit.
-
-The 96-bit candidate fingerprint is
-`SHA256(full encoded key)[0..12]`, equivalently
-`SHA256(namespace || logical payload)[0..12]`. The full encoded key already begins
-with its namespace byte; the namespace is never hashed twice. Account and storage
-primary partitions use the top seven bits of `SHA256(address)`, so
-an account and every storage incarnation share one of 128 checkpoint partitions. Code
-uses the equivalent code-hash route. Four primary partitions share each of 32 epoch
-data objects. Every nonempty data object contains sorted full keys and versions in bounded
-binary form, compressed with deterministic Zstd level 9.
-
-Every nonempty router partition has a compact index-delta object. Entries contain only
-a 96-bit route fingerprint, first-change block, data-object dictionary index, and run
-offset. A reader requires every dictionary reference it follows to exactly equal the
-corresponding data reference committed in that epoch descriptor, then compares the
-complete candidate key. Thus a malicious redirect or fingerprint collision fails
-closed or only adds candidate work; it cannot return another object/key.
-
-## Windows and checkpoints
-
-One active-window directory identifies its base checkpoint and at most 64 sealed
-epoch descriptors. Each descriptor covers at most 1,000 blocks, so a full window
-covers **at most** 64,000 blocks; short tail/fixture epochs make it smaller. Its start
-must match the commit, and its last epoch must end at the committed published block.
-The only empty-directory exception is immediately after a rollover, where
-`active_window_start == published_number + 1` using checked arithmetic. It is a
-bounded object rewritten once per epoch. A reader may scan at most 64 epoch deltas.
-After the 64th descriptor, publication builds exactly one closing checkpoint:
-
-1. seals and retains the completed-window directory;
-2. builds each of 128 primary checkpoint partitions independently, never one global
-   state map;
-3. filters storage pointers using the account's final existence/incarnation;
-4. shards each primary partition into at least 8 full-key-hash subshards, doubling to
-   16/32/.../256 until every decoded shard body is within the writer target, and emits
-   a count-bearing partition manifest plus global checkpoint manifest;
-5. appends the completed window to a numeric catalog chunk; and
-6. starts a new empty active directory based on that checkpoint.
-
-The writer hard-fails rather than emitting any checkpoint subshard body above 32 MiB
-decoded. If a shard remains oversized at 256-way subsharding, publication fails with an
-explicit capacity error. The partition manifest count must be a power of two in
-`8..=256`; readers derive its index from the corresponding additional full-key SHA-256
-bits. Format-v1 readers accept two `FSPS` encodings: the exact 293-byte fixed-eight
-form (`magic || version || 8 ObjectRef`s), where the count is implicitly 8, and the
-count-bearing adaptive form (`magic || version || u16 count || count ObjectRef`s). The
-writer emits only the count-bearing adaptive form; accepting the fixed-eight form is
-backward-compatible decoding. The global checkpoint manifest commits the boundary
-block. A checkpoint pointer is accepted only when its version is at or before that
-boundary and the next version is absent or after it. Manifest boundaries must match the directory base/tail boundary.
-A query fetches one global manifest, one partition manifest, one subshard, and its
-pointed data object. The completed-window catalog is two-level: a bounded root of at
-most 4,096 chunk references and chunks of at most 256 numerically sorted windows.
-Selection is always root plus one chunk regardless of archive age. Capacity is
-1,048,576 completed windows; publication fails closed rather than growing the root.
-State/data epochs, deltas, checkpoints, completed directories, catalog objects, and
-code remain durable.
-
-## Exact lookup
-
-For block B, a reader lazily selects the active directory from the commit or a
-completed directory from committed numeric catalog ranges. Selection uses encoded
-start/end ranges; it never assumes `floor(block / 1,000 / 64)` because epochs may be
-shorter than 1,000 blocks. The reader computes one router partition and searches
-applicable epoch index deltas newest to
-oldest (at most 64 after the base checkpoint). Fingerprint candidates are accepted
-only after full-key verification in a data run. If no post-checkpoint version exists,
-the exact checkpoint partition points directly to the current non-default version;
-otherwise the Ethereum default applies. Thus a value unchanged for millions of
-blocks resolves through one checkpoint pointer rather than publication history.
-Storage first resolves the account incarnation, then performs its co-partitioned slot
-lookup. Numeric/tag selectors are supported. Fossil EIP-1898 block-hash selectors fail
-explicitly until a durable bounded hash-to-number index exists; readers never scan all
-epoch block objects.
-
-Readers may lazily cache verified directory, index, checkpoint, and data objects. This
-cache is bounded, disposable, and never authoritative; readiness does not ingest
-history. Checkpoint construction also bounds its per-primary-partition decoded-data
-cache to two objects/16 MiB and releases it before the next partition. One logical RPC
-lookup has hard internal limits of 192 remote object GETs and 128 MiB total decoded
-bytes. Format-v1 publication caps data objects at 8 MiB decoded/8.25 MiB encoded and
-index objects at 2 MiB encoded so every native publication remains Worker-readable.
-The checkpoint writer cap is 32 MiB decoded per emitted shard; a native reader may use
-a different defensive decode ceiling, but that does not permit a writer to exceed
-32 MiB. Limit exhaustion fails closed. Process-wide concurrency remains an operator
-limit.
-
-## Publication and retention
-
-All epoch/data/index/checkpoint/catalog/code objects are uploaded create-only before
-the commit. The mutable head is changed last with CAS. Interrupted writers can leave
-unreachable objects but cannot expose an incomplete epoch. There is no
-publication-time deletion. Superseded active directories, commits, and orphans may be
-removed only by a future offline inventory/GC process after an operator-defined
-rollback window. Provider inventory and automatic GC are not implemented.
-
-Immutable keys remain:
+## Keys and values
 
 ```text
-objects/sha256/<first two digest hex>/<64 digest hex>
+account  = 0x01 || address20
+storage  = 0x02 || address20 || incarnation_u64_be || slot32
+code     = 0x03 || keccak256(bytecode)
 ```
+
+The namespace byte occurs exactly once. Full-key SHA-256 routes index lookups, so the storage of one large contract can span many partitions. Every encoded account/storage value is associated with its exact full key and the block after whose execution it became effective. Account records include existence, nonce, balance, code hash, and incarnation. Account tombstones and zero storage values are versions, not absent records. A recreated account receives a new incarnation; historical slots of earlier incarnations remain readable at earlier blocks. Code bytes are immutable, deduplicated objects checked against their Keccak code hash.
+
+The first sealed package may be an exhaustive anchor containing all live accounts and nonzero slots. Every subsequent package is a contiguous successor and contains only changes. The archive cannot answer blocks before the anchor. Epochs cover at most 1,000 contiguous finalized blocks; a short epoch may be sealed for publication freshness. Each epoch is retained as the canonical source of its normalized post-state events and block metadata.
+
+## Time-disjoint index runs
+
+The authoritative point-lookup index contains recent epoch runs and older compacted runs. Within a run, exact `(full_key, block)` records are sorted lexicographically and by ascending block, and contain the post-state value. Run block ranges are disjoint; all versions, including deletions and zeros, survive compaction. A byte-bounded builder merges whole adjacent ranges into the next level by streaming sorted records rather than materializing all live state. Unchanged canonical epoch objects remain durable; obsolete derived runs are not publication inputs after compaction.
+
+Publication appends each sealed epoch as one L0 run and never compacts. A separate compactor folds the oldest four L0 runs, together with every full level they cascade through, into one run using a single streaming k-way merge. Level `i` holds at most one run whose weight (in epochs) is a multiple of `4 * 8^i` and below `4 * 8^(i+1)`. Compaction commits by CAS against the current head, keeping any L0 runs published meanwhile; publication rebases onto a compacted head with the same block. At most 16 L0 runs may await compaction; beyond that publication fails with a backlog error rather than making reads unbounded. Steady state is at most three L0 runs plus one run per occupied level, so run count grows logarithmically with archive age.
+
+Each run has an exact `(full_key, block)` fence tree over 16 full-key-hash partitions. A fence uses `upper_bound((key, requested_block))` to locate the predecessor, verifies the full key and block, and returns the encoded value. The tree splits pages and routes hot keys by `(key, block)` so the number of versions for one key cannot enlarge one object without bound. Fence pages are at most 512 KiB, state pages and code blobs at most 1 MiB. A publisher fails before head CAS if it cannot satisfy the reader's bounds.
+
+Each run also has no-false-negative Bloom summaries (16 bits and 11 hashes per key, about 64 KiB and 32,768 keys per shard, at most 1 MiB) at deterministic paths `summaries/<run-root-hex>/{a,s}<index>`. The shard count is a power of two recorded in the head. Address shards are routed by the 20-byte address, so an account and all of its storage share one shard and one GET answers both halves of an account-plus-storage read. An address with more than 4,096 keys in one run instead sets a marker in its address shard and places its keys in full-key-routed spill shards. Each shard binds its run digest, kind, index and shard count and ends with a SHA-256 of its preceding bytes; a missing or mismatched shard is an error, never an absence. Readers probe runs newest to oldest, skip runs whose summary excludes the key, and verify every positive in the fence tree. Cold account-plus-storage cost is therefore one head GET, one summary GET per run (two for heavy addresses), and at most three fence/data GETs per hit, plus false positives.
+
+## Point lookup and cache
+
+An RPC request pins one verified commit. To read account or storage at block B, select the newest qualifying version with `version.block <= B` across runs whose ranges can contribute; absent keys resolve to Ethereum defaults. Storage resolves the account at B first and uses its incarnation when constructing the slot key. Code resolves the account, then the code hash and immutable blob. Hash selectors require a separately committed bounded hash-to-number catalog; numeric/tag state reads do not scan block catalogs or old commits.
+
+Immutable objects may be cached by verified digest in a bounded request-local, process, or edge cache. Caches are disposable and never change the answer. Frequently read state leaves fit the Worker's 2 MiB per-item cache limit. The mutable head has separate freshness semantics and must not be treated as an immutable cached object. The cold-cache p99 target for account plus storage is at most 20 R2 object GETs on representative busy and old-block workloads; warm-cache performance is measured separately. A request still has hard 192-GET and 128-MiB fetched/decoded resource limits, enforced before I/O and without relying on cache hits.
+
+## Publication, recovery and retention
+
+The writer verifies source chain identity, finalized continuity, package hashes and account/code lifecycle before publication. It records staged object references and compares the current remote head before CAS; a failed or retried upload cannot expose a partial run. Immutable object keys are `objects/sha256/<first two digest hex>/<64 digest hex>`. Reconciliation after a crash starts with the remote head rather than assuming local journal progress. The exporter may replay finalized chunks in parallel but commits them in block order.
+
+The live head and explicitly pinned rollback heads are GC roots. Canonical epoch data and code are retained; only unreachable superseded derived index objects and abandoned staged objects may be collected after a grace interval longer than the maximum request and upload lifetime. Readers use the latest committed index to serve all historical blocks, so old derived index generations are not required after the rollback interval.
