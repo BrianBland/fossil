@@ -77,12 +77,17 @@ pub fn shard_count(keys: u64) -> u32 {
     keys.div_ceil(SHARD_KEYS).max(1).next_power_of_two() as u32
 }
 
-pub fn shard_path(run: Hash32, kind: ShardKind, index: u32) -> String {
+/// The shard count is part of the path: identical run roots built with
+/// different summary sizing must not collide under create-only puts.
+pub fn shard_path(run: Hash32, shards: u32, kind: ShardKind, index: u32) -> String {
     let tag = match kind {
         ShardKind::Address => 'a',
         ShardKind::Spill => 's',
     };
-    format!("summaries/{}/{tag}{index:08x}", hex::encode(run.0))
+    format!(
+        "summaries/{}/{shards:08x}/{tag}{index:08x}",
+        hex::encode(run.0)
+    )
 }
 
 /// Streaming builder. Keys must be distinct and arrive in ascending order.
@@ -180,7 +185,7 @@ impl SummaryBuilder {
             out.extend_from_slice(&bits);
             let check = Hash32::digest(&out);
             out.extend_from_slice(&check.0);
-            (shard_path(run, kind, index), out)
+            (shard_path(run, shards, kind, index), out)
         };
         let address = self
             .address
@@ -289,7 +294,7 @@ mod tests {
         let mut decoded = std::collections::HashMap::new();
         for kind in [ShardKind::Address, ShardKind::Spill] {
             for index in 0..shards {
-                let bytes = &objects[&shard_path(run, kind, index)];
+                let bytes = &objects[&shard_path(run, shards, kind, index)];
                 decoded.insert(
                     (kind as u8, index),
                     Shard::decode(run, kind, index, shards, bytes)?,
@@ -314,7 +319,7 @@ mod tests {
             .count();
         assert!(false_positives < 50, "{false_positives}");
         assert!(!present(&key(2, 3, 0))? || !present(&key(2, 3, 1))?);
-        let mut tampered = objects[&shard_path(run, ShardKind::Address, 0)].clone();
+        let mut tampered = objects[&shard_path(run, shards, ShardKind::Address, 0)].clone();
         tampered[HEADER_BYTES] ^= 1;
         assert!(Shard::decode(run, ShardKind::Address, 0, shards, &tampered).is_err());
         assert!(Shard::decode(
@@ -322,7 +327,7 @@ mod tests {
             ShardKind::Address,
             0,
             shards,
-            &objects[&shard_path(run, ShardKind::Address, 0)]
+            &objects[&shard_path(run, shards, ShardKind::Address, 0)]
         )
         .is_err());
         Ok(())

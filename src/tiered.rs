@@ -12,11 +12,12 @@ use crate::format::{AccountEvent, Address, Hash32};
 use crate::normalized::{Mode, Package};
 use crate::run::{ObjectRef, Record, RunReader};
 use crate::store::{ArchiveStore, VersionedBytes};
-use crate::summary::{Probe, Shard, ShardKind, MAX_SHARD_BYTES};
+use crate::summary::{shard_path, Probe, Shard, ShardKind, MAX_SHARD_BYTES};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// L0 runs folded per compaction step.
@@ -29,6 +30,8 @@ const MAX_STAGED: usize = 256 * 1024 * 1024;
 const MAX_HEAD: usize = 256 * 1024;
 const MAX_CODE: usize = 1024 * 1024;
 const CAS_ATTEMPTS: usize = 32;
+const MAX_REQUEST_GETS: u32 = 192;
+const MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Ref {
@@ -271,6 +274,49 @@ fn package_records(package: &Package) -> Result<Vec<Record>> {
     Ok(records)
 }
 
+/// In-package lifecycle checks, run before any upload. An anchor is exhaustive, so
+/// every storage record and code reference must be established inside it. In a
+/// delta, storage of an address with an account record at or before the same
+/// block must use that record's incarnation.
+// ponytail: storage of addresses without an in-package account record, and code
+// reused from earlier packages, rely on the exporter's lifetime journal; checking
+// them here would cost reader GETs per touched address.
+fn validate_lifecycle(package: &Package) -> Result<()> {
+    let segment = &package.segment;
+    let mut accounts: HashMap<Address, Vec<&AccountEvent>> = HashMap::new();
+    for event in &segment.accounts {
+        accounts.entry(event.address).or_default().push(event);
+    }
+    for events in accounts.values_mut() {
+        events.sort_by_key(|event| event.block);
+    }
+    let anchor = matches!(package.mode, Mode::Anchor);
+    for event in &segment.storage {
+        let account = accounts.get(&event.address).and_then(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|account| account.block <= event.block)
+        });
+        match account {
+            Some(account) if account.exists && account.incarnation == event.incarnation => {}
+            Some(account) if !account.exists && event.value == [0; 32] => {}
+            None if !anchor => {}
+            _ => bail!("storage record does not match its account incarnation"),
+        }
+    }
+    if anchor {
+        let codes: HashSet<Hash32> = segment.code.iter().map(|blob| blob.code_hash).collect();
+        let empty = Hash32(Keccak256::digest([]).into());
+        if segment.accounts.iter().any(|account| {
+            account.exists && account.code_hash != empty && !codes.contains(&account.code_hash)
+        }) {
+            bail!("anchor account references code absent from the package");
+        }
+    }
+    Ok(())
+}
+
 fn is_published(head: &Head, package: &Package) -> bool {
     let segment = &package.segment;
     segment.blocks.last().is_some_and(|last| {
@@ -341,6 +387,7 @@ pub async fn publish(
     {
         bail!("tiered L0 compaction backlog is full");
     }
+    validate_lifecycle(package)?;
     let built = write_sorted(store, package_records(package)?).await?;
     let run = Run::new(first.number, last.number, 1, built);
     for _ in 0..CAS_ATTEMPTS {
@@ -472,6 +519,24 @@ pub struct Reader<'a> {
     runs: Vec<(Run, RunReader)>,
     shards: Mutex<HashMap<String, Arc<Shard>>>,
 }
+
+/// Hard per-request resource limits, charged with each object's maximum size
+/// before its GET is issued. Memoized summary shards are free.
+#[derive(Default)]
+struct Budget {
+    gets: AtomicU32,
+    bytes: AtomicU64,
+}
+impl Budget {
+    fn charge(&self, maximum: usize) -> Result<()> {
+        let gets = self.gets.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = self.bytes.fetch_add(maximum as u64, Ordering::Relaxed) + maximum as u64;
+        if gets > MAX_REQUEST_GETS || bytes > MAX_REQUEST_BYTES {
+            bail!("tiered read exceeds its per-request GET or byte budget");
+        }
+        Ok(())
+    }
+}
 impl<'a> Reader<'a> {
     pub async fn open(store: &'a dyn ArchiveStore, chain_id: u64) -> Result<Self> {
         let (_, head) = read_head(store, chain_id)
@@ -495,11 +560,18 @@ impl<'a> Reader<'a> {
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
-    async fn shard(&self, run: &Run, kind: ShardKind, index: u32) -> Result<Arc<Shard>> {
-        let path = crate::summary::shard_path(run.root.digest, kind, index);
+    async fn shard(
+        &self,
+        budget: &Budget,
+        run: &Run,
+        kind: ShardKind,
+        index: u32,
+    ) -> Result<Arc<Shard>> {
+        let path = shard_path(run.root.digest, run.shards, kind, index);
         if let Some(shard) = self.shards.lock().unwrap().get(&path) {
             return Ok(shard.clone());
         }
+        budget.charge(MAX_SHARD_BYTES)?;
         let bytes = self.store.get_bounded(&path, MAX_SHARD_BYTES).await?;
         let shard = Arc::new(Shard::decode(
             run.root.digest,
@@ -511,10 +583,10 @@ impl<'a> Reader<'a> {
         self.shards.lock().unwrap().insert(path, shard.clone());
         Ok(shard)
     }
-    async fn may_contain(&self, run: &Run, key: &[u8]) -> Result<bool> {
+    async fn may_contain(&self, budget: &Budget, run: &Run, key: &[u8]) -> Result<bool> {
         let probe = Probe::new(key, run.shards);
         let address = self
-            .shard(run, ShardKind::Address, probe.address_index)
+            .shard(budget, run, ShardKind::Address, probe.address_index)
             .await?;
         if address.contains(key) {
             return Ok(true);
@@ -523,21 +595,22 @@ impl<'a> Reader<'a> {
             return Ok(false);
         }
         Ok(self
-            .shard(run, ShardKind::Spill, probe.spill_index)
+            .shard(budget, run, ShardKind::Spill, probe.spill_index)
             .await?
             .contains(key))
     }
-    async fn lookup(&self, key: &[u8], block: u64) -> Result<Option<Vec<u8>>> {
+    async fn lookup(&self, budget: &Budget, key: &[u8], block: u64) -> Result<Option<Vec<u8>>> {
         if block > self.head.number {
             bail!("block outside pinned tiered history");
         }
         for (run, reader) in self.runs.iter().rev() {
-            if run.start > block || !self.may_contain(run, key).await? {
+            if run.start > block || !self.may_contain(budget, run, key).await? {
                 continue;
             }
             let value = reader
-                .lookup(key, block.min(run.end), |reference| {
-                    fetch(self.store, reference)
+                .lookup(key, block.min(run.end), |reference| async move {
+                    budget.charge(reference.length as usize)?;
+                    fetch(self.store, reference).await
                 })
                 .await?;
             if value.is_some() {
@@ -547,7 +620,15 @@ impl<'a> Reader<'a> {
         Ok(None)
     }
     pub async fn account(&self, address: Address, block: u64) -> Result<Option<AccountEvent>> {
-        let Some(value) = self.lookup(&account_key(address), block).await? else {
+        self.account_in(&Budget::default(), address, block).await
+    }
+    async fn account_in(
+        &self,
+        budget: &Budget,
+        address: Address,
+        block: u64,
+    ) -> Result<Option<AccountEvent>> {
+        let Some(value) = self.lookup(budget, &account_key(address), block).await? else {
             return Ok(None);
         };
         if value.len() != 81 || value[0] > 1 {
@@ -571,14 +652,19 @@ impl<'a> Reader<'a> {
         }))
     }
     pub async fn storage(&self, address: Address, slot: Hash32, block: u64) -> Result<[u8; 32]> {
-        let Some(account) = self.account(address, block).await? else {
+        let budget = Budget::default();
+        let Some(account) = self.account_in(&budget, address, block).await? else {
             return Ok([0; 32]);
         };
         if !account.exists {
             return Ok([0; 32]);
         }
         let value = self
-            .lookup(&storage_key(address, account.incarnation, slot), block)
+            .lookup(
+                &budget,
+                &storage_key(address, account.incarnation, slot),
+                block,
+            )
             .await?;
         match value {
             Some(value) => Ok(value
@@ -588,7 +674,8 @@ impl<'a> Reader<'a> {
         }
     }
     pub async fn code(&self, address: Address, block: u64) -> Result<Vec<u8>> {
-        let Some(account) = self.account(address, block).await? else {
+        let budget = Budget::default();
+        let Some(account) = self.account_in(&budget, address, block).await? else {
             return Ok(Vec::new());
         };
         if !account.exists {
@@ -599,7 +686,7 @@ impl<'a> Reader<'a> {
             return Ok(Vec::new());
         }
         let bytes = self
-            .lookup(&code_key(account.code_hash), block)
+            .lookup(&budget, &code_key(account.code_hash), block)
             .await?
             .context("missing account code blob")?;
         if bytes.len() > MAX_CODE || Hash32(Keccak256::digest(&bytes).into()) != account.code_hash {
@@ -734,6 +821,32 @@ mod tests {
         ) -> Result<()> {
             self.inner.compare_and_swap(key, expected, bytes).await
         }
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_inconsistent_lifecycles() -> Result<()> {
+        let store = MemoryArchiveStore::default();
+        let address = Address([0x11; 20]);
+        let slot = h(2);
+        let mut wrong_incarnation = anchor(address, slot)?;
+        wrong_incarnation.segment.storage[0].incarnation = 1;
+        let error = publish(&store, &wrong_incarnation, &gate(0, h(1)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("incarnation"));
+        let mut missing_code = anchor(address, slot)?;
+        missing_code.segment.accounts[0].code_hash = h(9);
+        let error = publish(&store, &missing_code, &gate(0, h(1)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("code"));
+        assert!(store.read_mutable(&head_key(1)).await?.is_none());
+        publish(&store, &anchor(address, slot)?, &gate(0, h(1))).await?;
+        let mut stale = delta(1, h(1), h(1), address, slot);
+        stale.segment.storage[0].incarnation = 0;
+        assert!(publish(&store, &stale, &gate(1, h(3))).await.is_err());
+        assert_eq!(head(&store).await?.number, 0);
+        Ok(())
     }
 
     #[tokio::test]
