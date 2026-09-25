@@ -1,0 +1,30 @@
+[package]
+name = "fossil-worker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0"
+fossil-codec = { path = "../codec", default-features = false }
+futures-util = "0.3.31"
+hex = "0.4.3"
+serde_json = "1.0.140"
+sha3 = "0.10.8"
+worker = "0.8.6"
+
+[dev-dependencies]
+fossil = { path = ".." }
+futures = "0.3.31"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

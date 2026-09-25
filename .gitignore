@@ -1,0 +1,7 @@
+/target/
+/fossil-cache/
+*.tmp
+/benchmarks/results/manual-*.json
+.DS_Store
+/codec/target/
+/codec/Cargo.lock

@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "scripts": {
+    "build": "worker-build --release --no-panic-recovery",
+    "check": "cargo fmt --check && cargo test && cargo check --target wasm32-unknown-unknown",
+    "deploy": "wrangler deploy --config wrangler.toml"
+  },
+  "devDependencies": {
+    "wrangler": "4.135.0"
+  }
+}

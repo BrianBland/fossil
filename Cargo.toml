@@ -1,0 +1,34 @@
+[package]
+name = "fossil"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Immutable historical state archive prototype for EVM-compatible chains"
+repository = "https://github.com/BrianBland/fossil"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+fossil-codec = { path = "codec" }
+fs2 = "0.4"
+futures-util = "0.3"
+hex = "0.4"
+moka = { version = "0.12", features = ["sync"] }
+object_store = { version = "0.11", features = ["aws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+strip = true

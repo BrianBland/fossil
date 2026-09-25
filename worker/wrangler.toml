@@ -1,0 +1,15 @@
+name = "fossil-r2-gateway"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-02-24"
+preview_urls = false
+
+[build]
+command = "worker-build --release --no-panic-recovery"
+
+[vars]
+IMMUTABLE_PREFIX = "v1/"
+CHAIN_ID = "8453"
+
+[[r2_buckets]]
+binding = "ARCHIVE"
+bucket_name = "fossil"
