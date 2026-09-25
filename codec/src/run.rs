@@ -194,12 +194,33 @@ impl RunReader {
 
     /// Every object this run references besides its root: fence roots, fence
     /// leaves and data pages. Walks only index objects; data pages are never fetched.
-    pub async fn object_refs<F, Fut>(&self, mut fetch: F) -> Result<Vec<ObjectRef>>
+    pub async fn object_refs<F, Fut>(&self, fetch: F) -> Result<Vec<ObjectRef>>
+    where
+        F: FnMut(ObjectRef) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    {
+        let (mut refs, pages) = self.walk(fetch).await?;
+        refs.extend(pages.into_iter().flatten());
+        Ok(refs)
+    }
+
+    /// Data page references per partition, in the order a scanner reads them.
+    pub async fn data_pages<F, Fut>(&self, fetch: F) -> Result<Vec<Vec<ObjectRef>>>
+    where
+        F: FnMut(ObjectRef) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    {
+        Ok(self.walk(fetch).await?.1)
+    }
+
+    /// Index objects, then data pages grouped by partition in scan order.
+    async fn walk<F, Fut>(&self, mut fetch: F) -> Result<(Vec<ObjectRef>, Vec<Vec<ObjectRef>>)>
     where
         F: FnMut(ObjectRef) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>>>,
     {
         let mut refs = Vec::new();
+        let mut pages = vec![Vec::new(); PARTITIONS];
         for (shard, root) in self.indexes.iter().enumerate() {
             if *root == ObjectRef::default() {
                 continue;
@@ -219,9 +240,9 @@ impl RunReader {
             } else {
                 decode_index(*root, &bytes, shard, INDEX_MAGIC)?
             };
-            refs.extend(leaves.into_iter().map(|fence| fence.data));
+            pages[shard].extend(leaves.into_iter().map(|fence| fence.data));
         }
-        Ok(refs)
+        Ok((refs, pages))
     }
 
     /// Create a bounded scanner over all routed partitions of this run.

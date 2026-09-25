@@ -31,7 +31,7 @@ enum Command {
     Serve(ServeArgs),
     /// Verify the committed head and commit. Lazy objects verify when read.
     Verify(StoreArgs),
-    /// Delete objects unreachable from the head. Stop all writers first.
+    /// Delete objects unreachable from the head; safe alongside writers.
     Gc(GcArgs),
     /// Measure cold GETs and bytes of account-plus-storage reads over samples.
     Probe(ProbeArgs),
@@ -68,8 +68,9 @@ struct GcArgs {
     /// Also keep this many predecessor head copies (audit history).
     #[arg(long, default_value_t = 16)]
     keep_heads: usize,
-    /// Never delete objects modified more recently than this.
-    #[arg(long, default_value_t = 600)]
+    /// Never delete objects modified more recently than this (default 3 hours;
+    /// must exceed the compaction deadline and the writer refresh age).
+    #[arg(long, default_value_t = tiered::GC_MIN_AGE.as_secs())]
     min_age_seconds: u64,
     /// Report what would be deleted without deleting.
     #[arg(long)]

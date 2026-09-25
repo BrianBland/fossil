@@ -376,7 +376,11 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
     }
     let refs = inputs.iter().map(Run::input).collect::<Result<Vec<_>>>()?;
     let expected: u64 = inputs.iter().map(|run| run.keys).sum();
+    let merge_started = std::time::Instant::now();
     let built = merge_runs(store, &refs, expected).await?;
+    if merge_started.elapsed() > MERGE_DEADLINE {
+        bail!("compaction exceeded its deadline; its output is left for garbage collection");
+    }
     levels[target] = Some(new_run(
         inputs[0].start,
         inputs.last().unwrap().end,
@@ -426,29 +430,26 @@ pub struct GcReport {
     pub kept_young: usize,
 }
 
-/// Delete immutable objects unreachable from the current head: superseded runs'
-/// pages, fences, roots and summary shards, plus head copies beyond the newest
-/// `keep_heads`. Only objects older than `min_age` are deleted, and nothing is
-/// deleted if the head changes during the pass.
-///
-/// Run with publishers and compactors stopped: a writer can re-reference an old
-/// unreachable object by content address, which a concurrent sweep could delete.
-/// Readers pinned to a superseded head may fail once its runs are gone.
-pub async fn collect_garbage(
+/// Default age below which garbage collection never deletes an object. It must
+/// exceed `MERGE_DEADLINE` (unreferenced in-flight output) and
+/// `store::REFRESH_AFTER` (writers re-stamp reused objects older than that).
+pub const GC_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+/// A compaction slower than this abandons its output rather than commit objects
+/// that garbage collection may already consider old.
+const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+/// Keys of every object reachable from `head`, plus its newest `keep_heads` copies.
+async fn reachable(
     store: &dyn ArchiveStore,
-    chain_id: u64,
+    head: &Head,
     keep_heads: usize,
-    min_age: std::time::Duration,
-    dry_run: bool,
-) -> Result<GcReport> {
-    let started = std::time::SystemTime::now();
-    let (before, head) = read_head(store, chain_id)
-        .await?
-        .context("missing tiered head")?;
-    let mut live = HashSet::new();
+    live: &mut HashSet<String>,
+) -> Result<()> {
     for run in head.runs() {
         let (root, bytes) = run.input()?;
-        live.insert(root.digest.object_key());
+        if !live.insert(root.digest.object_key()) {
+            continue;
+        }
         let refs = RunReader::decode(root, &bytes)?
             .object_refs(|reference| fetch(store, reference))
             .await?;
@@ -474,18 +475,50 @@ pub async fn collect_garbage(
             .ok()
             .and_then(|head| head.parent);
     }
+    Ok(())
+}
+
+/// Delete immutable objects unreachable from the head: superseded runs' pages,
+/// fences, roots and summary shards, plus head copies beyond the newest
+/// `keep_heads`. Safe alongside publishers and compactors:
+/// - objects younger than `min_age` (in-flight output) are never deleted;
+/// - objects reachable from the head read *after* listing are kept too;
+/// - each candidate's age is re-checked immediately before deletion, and writers
+///   re-stamp any old identical object they reuse (`store::REFRESH_AFTER`).
+///
+/// Readers pinned to a superseded head may fail once its runs are gone.
+// ponytail: a writer re-stamping an object between its re-check and delete (a
+// millisecond window) could still lose it; add conditional deletes if the store
+// gains them.
+pub async fn collect_garbage(
+    store: &dyn ArchiveStore,
+    chain_id: u64,
+    keep_heads: usize,
+    min_age: std::time::Duration,
+    dry_run: bool,
+) -> Result<GcReport> {
+    let started = std::time::SystemTime::now();
+    let (_, head) = read_head(store, chain_id)
+        .await?
+        .context("missing tiered head")?;
+    let mut live = HashSet::new();
+    reachable(store, &head, keep_heads, &mut live).await?;
+    let listed = [
+        store.list("objects/").await?,
+        store.list("summaries/").await?,
+    ]
+    .concat();
+    let (_, head) = read_head(store, chain_id)
+        .await?
+        .context("tiered head vanished")?;
+    reachable(store, &head, keep_heads, &mut live).await?;
     let cutoff = started - min_age;
     let mut report = GcReport {
         live_objects: live.len(),
         ..GcReport::default()
     };
     let mut doomed = Vec::new();
-    for listed in [
-        store.list("objects/").await?,
-        store.list("summaries/").await?,
-    ]
-    .concat()
-    {
+    for listed in listed {
         if live.contains(&listed.key) {
             continue;
         }
@@ -493,21 +526,30 @@ pub async fn collect_garbage(
             report.kept_young += 1;
             continue;
         }
+        doomed.push(listed);
+    }
+    let deleted = futures_util::stream::iter(doomed.into_iter().map(Ok::<_, anyhow::Error>))
+        .map_ok(|listed| async move {
+            let fresh = store
+                .modified(&listed.key)
+                .await?
+                .is_none_or(|modified| modified > cutoff);
+            if fresh {
+                return Ok(None);
+            }
+            if !dry_run {
+                store.delete(&listed.key).await?;
+            }
+            Ok::<_, anyhow::Error>(Some(listed.size))
+        })
+        .try_buffer_unordered(32)
+        .try_collect::<Vec<_>>()
+        .await?;
+    for size in deleted.iter().flatten() {
         report.deleted_objects += 1;
-        report.deleted_bytes += listed.size;
-        doomed.push(listed.key);
+        report.deleted_bytes += size;
     }
-    let (after, _) = read_head(store, chain_id)
-        .await?
-        .context("tiered head vanished")?;
-    if after.bytes != before.bytes {
-        bail!("tiered head changed during garbage collection; stop writers and retry");
-    }
-    if !dry_run {
-        futures_util::stream::iter(doomed.into_iter().map(Ok::<_, anyhow::Error>))
-            .try_for_each_concurrent(32, |key| async move { store.delete(&key).await })
-            .await?;
-    }
+    report.kept_young += deleted.iter().filter(|size| size.is_none()).count();
     Ok(report)
 }
 
@@ -1023,6 +1065,67 @@ mod tests {
                 .nonce,
             41
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_spares_in_flight_and_reused_objects() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = crate::store::open_store(root.path().to_str().unwrap(), None, None).await?;
+        let store = store.as_ref();
+        let address = Address([0x11; 20]);
+        let slot = h(2);
+        publish(store, &anchor(address, slot)?, &gate(0, h(1))).await?;
+        let mut parent = h(1);
+        for n in 1..=8 {
+            let package = delta(n, parent, h(1), address, slot);
+            parent = package.segment.blocks[0].hash;
+            publish(store, &package, &gate(n, parent)).await?;
+            drain(store).await?;
+        }
+        let age = |key: &str, when: std::time::SystemTime| -> Result<()> {
+            std::fs::File::options()
+                .write(true)
+                .open(root.path().join(key))?
+                .set_modified(when)?;
+            Ok(())
+        };
+        let old = std::time::SystemTime::now() - 2 * GC_MIN_AGE;
+        for listed in store.list("").await? {
+            age(&listed.key, old)?;
+        }
+        // An unreferenced object a writer just uploaded (not yet in any head).
+        let in_flight = Hash32::digest(b"in-flight page").object_key();
+        store.put_immutable(&in_flight, b"in-flight page").await?;
+        // Old garbage that a writer re-uploads (identical bytes) before GC deletes it.
+        let garbage = collect_garbage(store, 1, 0, GC_MIN_AGE, true).await?;
+        assert!(garbage.deleted_objects > 1);
+        let live: HashSet<String> = {
+            let mut live = HashSet::new();
+            reachable(store, &read_head(store, 1).await?.unwrap().1, 0, &mut live).await?;
+            live
+        };
+        let reused = store
+            .list("objects/")
+            .await?
+            .into_iter()
+            .find(|listed| !live.contains(&listed.key) && listed.key != in_flight)
+            .unwrap()
+            .key;
+        let bytes = store.get(&reused).await?;
+        store.put_immutable(&reused, &bytes).await?;
+        let report = collect_garbage(store, 1, 0, GC_MIN_AGE, false).await?;
+        assert_eq!(report.deleted_objects, garbage.deleted_objects - 1);
+        assert_eq!(report.kept_young, 2);
+        assert_eq!(store.get(&in_flight).await?, b"in-flight page");
+        assert_eq!(store.get(&reused).await?, bytes);
+        let reader = Reader::open(store, 1).await?;
+        for block in 0..=8 {
+            assert_eq!(
+                reader.account(address, block).await?.unwrap().incarnation,
+                block
+            );
+        }
         Ok(())
     }
 

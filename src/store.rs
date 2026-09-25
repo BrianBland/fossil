@@ -22,6 +22,14 @@ pub struct VersionedBytes {
     pub version: String,
 }
 
+/// An identical object that already exists is re-written (same bytes) when it is
+/// older than this, so garbage collection's age check sees it as freshly used.
+pub const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn stale(modified: SystemTime) -> bool {
+    modified.elapsed().is_ok_and(|age| age > REFRESH_AFTER)
+}
+
 /// One listed object, for inventory and garbage collection.
 #[derive(Clone, Debug)]
 pub struct Listed {
@@ -35,6 +43,8 @@ pub trait ArchiveStore: Send + Sync {
     /// Every object whose key starts with `prefix` (keys relative to the store).
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Last-modified time of an object, or `None` when it does not exist.
+    async fn modified(&self, key: &str) -> Result<Option<SystemTime>>;
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
     /// Fetch at most `maximum` bytes, rejecting provider metadata before buffering.
     async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>>;
@@ -145,6 +155,17 @@ impl ArchiveStore for MemoryArchiveStore {
                 modified: SystemTime::UNIX_EPOCH,
             })
             .collect())
+    }
+
+    async fn modified(&self, key: &str) -> Result<Option<SystemTime>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("memory store lock poisoned"))?;
+        Ok(state
+            .entries
+            .contains_key(key)
+            .then_some(SystemTime::UNIX_EPOCH))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -291,6 +312,9 @@ impl ArchiveStore for CountingStore {
     }
     async fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key).await
+    }
+    async fn modified(&self, key: &str) -> Result<Option<SystemTime>> {
+        self.inner.modified(key).await
     }
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let bytes = self.inner.get(key).await?;
@@ -457,6 +481,14 @@ impl ArchiveStore for FsArchiveStore {
         Ok(out)
     }
 
+    async fn modified(&self, key: &str) -> Result<Option<SystemTime>> {
+        match std::fs::metadata(self.path(key)) {
+            Ok(metadata) => Ok(Some(metadata.modified()?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         match std::fs::remove_file(self.path(key)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
@@ -477,10 +509,16 @@ impl ArchiveStore for FsArchiveStore {
         let path = self.path(key);
         if path.exists() {
             let existing = self.get_bounded(key, bytes.len()).await?;
-            if existing == bytes {
-                return Ok(());
+            if existing != bytes {
+                bail!("immutable object collision at {key}");
             }
-            bail!("immutable object collision at {key}");
+            if stale(std::fs::metadata(&path)?.modified()?) {
+                File::options()
+                    .write(true)
+                    .open(&path)?
+                    .set_modified(SystemTime::now())?;
+            }
+            return Ok(());
         }
         self.create_parent_directories(&path)?;
         let parent = path.parent().ok_or_else(|| anyhow!("path has no parent"))?;
@@ -627,6 +665,14 @@ impl ArchiveStore for ObjectArchiveStore {
         Ok(out)
     }
 
+    async fn modified(&self, key: &str) -> Result<Option<SystemTime>> {
+        match self.inner.head(&self.key(key)).await {
+            Ok(meta) => Ok(Some(meta.last_modified.into())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         match self.inner.delete(&self.key(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
@@ -660,12 +706,24 @@ impl ArchiveStore for ObjectArchiveStore {
         match result {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = self.get_bounded(key, bytes.len()).await?;
-                if existing == bytes {
-                    Ok(())
-                } else {
+                let found = self.inner.get(&path).await?;
+                let modified: SystemTime = found.meta.last_modified.into();
+                let existing = collect_object_stream_bounded(found, bytes.len()).await?;
+                if existing != bytes {
                     bail!("immutable object collision at {key}")
                 }
+                // Same bytes, so overwriting is invisible to readers; it only
+                // resets the age garbage collection uses to spare reused objects.
+                if stale(modified) {
+                    self.inner
+                        .put_opts(
+                            &path,
+                            Bytes::copy_from_slice(bytes).into(),
+                            PutOptions::default(),
+                        )
+                        .await?;
+                }
+                Ok(())
             }
             Err(error) => Err(error.into()),
         }

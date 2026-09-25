@@ -6,10 +6,13 @@ use crate::store::ArchiveStore;
 use crate::summary::SummaryBuilder;
 use anyhow::{anyhow, bail, Result};
 use futures_util::{stream, TryStreamExt};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 const PAGE_LIMIT: usize = 1024 * 1024;
 const IN_FLIGHT: usize = 32;
+const READ_AHEAD: usize = 8;
 
 /// A written run: every data, index, root and summary object is durable.
 #[derive(Clone, Debug)]
@@ -34,8 +37,70 @@ pub async fn fetch(store: &dyn ArchiveStore, reference: ObjectRef) -> Result<Vec
     Ok(bytes)
 }
 
+#[cfg(test)]
 async fn next(scanner: &mut RunScanner, store: &dyn ArchiveStore) -> Result<Option<Record>> {
     scanner.next(|reference| fetch(store, reference)).await
+}
+
+/// Data pages fetched ahead of each partition's scanner. A merge is otherwise
+/// bound by one sequential R2 round trip per page.
+// ponytail: memory is READ_AHEAD pages per run partition (about 16 * runs *
+// READ_AHEAD MiB worst case); spawn background fetches if batching stops sufficing.
+struct ReadAhead<'a> {
+    store: &'a dyn ArchiveStore,
+    /// Page digest -> (list, position) in `lists`.
+    order: HashMap<Hash32, (usize, usize)>,
+    lists: Vec<Vec<ObjectRef>>,
+    ready: Mutex<HashMap<Hash32, Vec<u8>>>,
+}
+
+impl<'a> ReadAhead<'a> {
+    async fn new(store: &'a dyn ArchiveStore, readers: &[RunReader]) -> Result<Self> {
+        let mut lists = Vec::new();
+        for reader in readers {
+            lists.extend(
+                reader
+                    .data_pages(|reference| fetch(store, reference))
+                    .await?,
+            );
+        }
+        let mut order = HashMap::new();
+        for (list, pages) in lists.iter().enumerate() {
+            for (position, page) in pages.iter().enumerate() {
+                order.entry(page.digest).or_insert((list, position));
+            }
+        }
+        Ok(Self {
+            store,
+            order,
+            lists,
+            ready: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn get(&self, reference: ObjectRef) -> Result<Vec<u8>> {
+        if let Some(bytes) = self.ready.lock().unwrap().remove(&reference.digest) {
+            return Ok(bytes);
+        }
+        let Some(&(list, position)) = self.order.get(&reference.digest) else {
+            return fetch(self.store, reference).await;
+        };
+        let batch: Vec<ObjectRef> = self.lists[list][position..]
+            .iter()
+            .take(READ_AHEAD)
+            .copied()
+            .collect();
+        let fetched =
+            futures_util::future::try_join_all(batch.iter().map(|page| fetch(self.store, *page)))
+                .await?;
+        let mut fetched = batch.into_iter().zip(fetched);
+        let (_, first) = fetched.next().expect("batch starts with the request");
+        self.ready
+            .lock()
+            .unwrap()
+            .extend(fetched.map(|(page, bytes)| (page.digest, bytes)));
+        Ok(first)
+    }
 }
 
 async fn put_all(store: &dyn ArchiveStore, objects: Vec<(String, Vec<u8>)>) -> Result<()> {
@@ -85,10 +150,13 @@ pub async fn merge_runs(
     runs: &[(ObjectRef, Vec<u8>)],
     expected_keys: u64,
 ) -> Result<BuiltRun> {
-    let mut scanners = Vec::with_capacity(runs.len());
+    let mut readers = Vec::with_capacity(runs.len());
     for (reference, bytes) in runs {
-        scanners.push(RunReader::decode(*reference, bytes)?.scanner());
+        readers.push(RunReader::decode(*reference, bytes)?);
     }
+    let read_ahead = ReadAhead::new(store, &readers).await?;
+    let read_ahead = &read_ahead;
+    let mut scanners: Vec<RunScanner> = readers.iter().map(RunReader::scanner).collect();
     let (records_tx, mut records_rx) = mpsc::channel::<Record>(IN_FLIGHT);
     let (objects_tx, objects_rx) = mpsc::channel(IN_FLIGHT);
 
@@ -111,7 +179,7 @@ pub async fn merge_runs(
         let mut summary = SummaryBuilder::new(expected_keys)?;
         let mut heads = Vec::with_capacity(scanners.len());
         for scanner in &mut scanners {
-            heads.push(next(scanner, store).await?);
+            heads.push(scanner.next(|page| read_ahead.get(page)).await?);
         }
         let mut last_key: Option<Vec<u8>> = None;
         loop {
@@ -133,7 +201,7 @@ pub async fn merge_runs(
             }
             let Some(index) = chosen else { break };
             let record = heads[index].take().unwrap();
-            heads[index] = next(&mut scanners[index], store).await?;
+            heads[index] = scanners[index].next(|page| read_ahead.get(page)).await?;
             if last_key.as_deref() != Some(record.key.as_slice()) {
                 summary.add(&record.key);
                 last_key = Some(record.key.clone());
@@ -222,6 +290,86 @@ mod tests {
                 (b"z".to_vec(), 0)
             ]
         );
+        Ok(())
+    }
+
+    /// Delays every GET and records the peak number in flight.
+    struct Slow {
+        inner: MemoryArchiveStore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ArchiveStore for Slow {
+        async fn list(&self, prefix: &str) -> Result<Vec<crate::store::Listed>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn modified(&self, key: &str) -> Result<Option<std::time::SystemTime>> {
+            self.inner.modified(key).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>> {
+            self.inner.get(key).await
+        }
+        async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            self.inner.get_bounded(key, maximum).await
+        }
+        async fn put_immutable(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_immutable(key, bytes).await
+        }
+        async fn read_mutable(&self, key: &str) -> Result<Option<crate::store::VersionedBytes>> {
+            self.inner.read_mutable(key).await
+        }
+        async fn read_mutable_bounded(
+            &self,
+            key: &str,
+            maximum: usize,
+        ) -> Result<Option<crate::store::VersionedBytes>> {
+            self.inner.read_mutable_bounded(key, maximum).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<&crate::store::VersionedBytes>,
+            bytes: &[u8],
+        ) -> Result<()> {
+            self.inner.compare_and_swap(key, expected, bytes).await
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_reads_pages_ahead_and_keeps_every_record() -> Result<()> {
+        let store = Slow {
+            inner: MemoryArchiveStore::default(),
+            in_flight: 0.into(),
+            peak: 0.into(),
+        };
+        let run = |block: u64| {
+            let mut records: Vec<_> = (0..20_000_u32)
+                .map(|key| record(&key.to_be_bytes(), block, &[block as u8; 2000]))
+                .collect();
+            records.sort_by(|a, b| a.key.cmp(&b.key));
+            records
+        };
+        let a = write_sorted(&store, run(1)).await?;
+        let b = write_sorted(&store, run(2)).await?;
+        let merged = merge_runs(&store, &[input(&a), input(&b)], 40_000).await?;
+        assert_eq!(merged.keys, 20_000);
+        assert!(store.peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+        let reader = RunReader::decode(merged.root, &merged.root_bytes)?;
+        let mut scanner = reader.scanner();
+        let mut count = 0;
+        while next(&mut scanner, &store).await?.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 40_000);
         Ok(())
     }
 
