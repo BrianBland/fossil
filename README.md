@@ -6,6 +6,8 @@ a node continuously export sealed history into one R2/S3-compatible object store
 many cheap, disposable readers — the native server or a Rust/WASM Cloudflare Worker —
 share that store.
 
+New here? Start with the [visual storage guide](docs/storage-guide.md).
+
 This repository defines the **tiered v1** format ([format](docs/format.md)): every
 sealed epoch becomes an immutable run of exact `(key, block)` versions; runs are
 merged into logarithmically many time-disjoint levels by a separate compactor; and one
