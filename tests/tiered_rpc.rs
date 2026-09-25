@@ -81,6 +81,10 @@ async fn cli_publishes_compacts_verifies_and_serves_tiered_state() {
     assert!(fossil(&archive).contains("published through 2"));
     assert!(fossil(&["compact"]).contains("drained after 0 commits"));
     assert!(fossil(&["verify"]).contains("through 2 with 1 runs"));
+    let gc: Value =
+        serde_json::from_str(&fossil(&["gc", "--min-age-seconds", "0", "--dry-run"])).unwrap();
+    assert_eq!(gc["deleted_objects"], 0, "{gc}");
+    assert!(gc["live_objects"].as_u64().unwrap() > 3, "{gc}");
     let samples = root.path().join("samples.jsonl");
     std::fs::write(
         &samples,

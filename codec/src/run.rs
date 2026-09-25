@@ -192,6 +192,38 @@ impl RunReader {
         Ok(Self { indexes })
     }
 
+    /// Every object this run references besides its root: fence roots, fence
+    /// leaves and data pages. Walks only index objects; data pages are never fetched.
+    pub async fn object_refs<F, Fut>(&self, mut fetch: F) -> Result<Vec<ObjectRef>>
+    where
+        F: FnMut(ObjectRef) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    {
+        let mut refs = Vec::new();
+        for (shard, root) in self.indexes.iter().enumerate() {
+            if *root == ObjectRef::default() {
+                continue;
+            }
+            validate_index_ref(*root)?;
+            refs.push(*root);
+            let bytes = fetch(*root).await.context("fetch run fence root")?;
+            let leaves = if bytes.starts_with(INTERNAL_MAGIC) {
+                let mut leaves = Vec::new();
+                for parent in decode_index(*root, &bytes, shard, INTERNAL_MAGIC)? {
+                    validate_index_ref(parent.data)?;
+                    refs.push(parent.data);
+                    let leaf = fetch(parent.data).await.context("fetch run fence leaf")?;
+                    leaves.extend(decode_index(parent.data, &leaf, shard, INDEX_MAGIC)?);
+                }
+                leaves
+            } else {
+                decode_index(*root, &bytes, shard, INDEX_MAGIC)?
+            };
+            refs.extend(leaves.into_iter().map(|fence| fence.data));
+        }
+        Ok(refs)
+    }
+
     /// Create a bounded scanner over all routed partitions of this run.
     pub fn scanner(&self) -> RunScanner {
         RunScanner {
@@ -976,6 +1008,31 @@ mod tests {
             );
             assert_eq!(calls, 3);
         }
+    }
+
+    #[tokio::test]
+    async fn object_refs_cover_every_emitted_object_but_the_root() {
+        let mut records = Vec::new();
+        for key in 0..20_000_u32 {
+            records.push(Record {
+                key: key.to_be_bytes().to_vec(),
+                block: 1,
+                value: vec![7; 200],
+            });
+        }
+        records.sort_by(|a, b| a.key.cmp(&b.key));
+        let (reader, objects, _) = build(records);
+        let refs = reader
+            .object_refs(|reference| {
+                let bytes = objects.get(&reference.digest).cloned();
+                async move { bytes.context("missing") }
+            })
+            .await
+            .unwrap();
+        let mut found: Vec<_> = refs.iter().map(|r| r.digest).collect();
+        found.sort();
+        found.dedup();
+        assert_eq!(found.len() + 1, objects.len());
     }
 
     #[tokio::test]

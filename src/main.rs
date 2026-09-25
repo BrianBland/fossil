@@ -31,6 +31,8 @@ enum Command {
     Serve(ServeArgs),
     /// Verify the committed head and commit. Lazy objects verify when read.
     Verify(StoreArgs),
+    /// Delete objects unreachable from the head. Stop all writers first.
+    Gc(GcArgs),
     /// Measure cold GETs and bytes of account-plus-storage reads over samples.
     Probe(ProbeArgs),
 }
@@ -57,6 +59,21 @@ struct CompactArgs {
     /// Keep polling for new L0 runs at this interval instead of exiting.
     #[arg(long)]
     follow_seconds: Option<u64>,
+}
+
+#[derive(Args)]
+struct GcArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Also keep this many predecessor head copies (audit history).
+    #[arg(long, default_value_t = 16)]
+    keep_heads: usize,
+    /// Never delete objects modified more recently than this.
+    #[arg(long, default_value_t = 600)]
+    min_age_seconds: u64,
+    /// Report what would be deleted without deleting.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -150,6 +167,20 @@ async fn main() -> Result<()> {
         Command::Serve(args) => run_server(args).await,
         Command::Verify(args) => verify(args).await,
         Command::Probe(args) => probe(args).await,
+        Command::Gc(args) => {
+            let chain_id = parse_quantity(&args.store.chain_id)?;
+            let store = open(&args.store).await?;
+            let report = tiered::collect_garbage(
+                store.as_ref(),
+                chain_id,
+                args.keep_heads,
+                std::time::Duration::from_secs(args.min_age_seconds),
+                args.dry_run,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(())
+        }
     }
 }
 

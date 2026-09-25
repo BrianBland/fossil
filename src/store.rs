@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tempfile::NamedTempFile;
 use url::Url;
 
@@ -21,8 +22,19 @@ pub struct VersionedBytes {
     pub version: String,
 }
 
+/// One listed object, for inventory and garbage collection.
+#[derive(Clone, Debug)]
+pub struct Listed {
+    pub key: String,
+    pub size: u64,
+    pub modified: SystemTime,
+}
+
 #[async_trait]
 pub trait ArchiveStore: Send + Sync {
+    /// Every object whose key starts with `prefix` (keys relative to the store).
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>>;
+    async fn delete(&self, key: &str) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
     /// Fetch at most `maximum` bytes, rejecting provider metadata before buffering.
     async fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>>;
@@ -118,6 +130,32 @@ impl MemoryState {
 
 #[async_trait]
 impl ArchiveStore for MemoryArchiveStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("memory store lock poisoned"))?;
+        Ok(state
+            .entries
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, entry)| Listed {
+                key: key.clone(),
+                size: entry.bytes.len() as u64,
+                modified: SystemTime::UNIX_EPOCH,
+            })
+            .collect())
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("memory store lock poisoned"))?
+            .entries
+            .remove(key);
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         self.state
             .lock()
@@ -248,6 +286,12 @@ impl CountingStore {
 
 #[async_trait]
 impl ArchiveStore for CountingStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let bytes = self.inner.get(key).await?;
         self.count(bytes.len());
@@ -376,6 +420,50 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 #[async_trait]
 impl ArchiveStore for FsArchiveStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        let mut out = Vec::new();
+        let mut pending = vec![self.root.clone()];
+        while let Some(directory) = pending.pop() {
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                let path = entry.path();
+                if metadata.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                // Skip in-flight temporary files of a concurrent writer.
+                if entry.file_name().to_string_lossy().starts_with(".tmp") {
+                    continue;
+                }
+                let key = path
+                    .strip_prefix(&self.root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if key.starts_with(prefix) {
+                    out.push(Listed {
+                        key,
+                        size: metadata.len(),
+                        modified: metadata.modified()?,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(key)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         std::fs::read(self.path(key)).with_context(|| format!("read object {key}"))
     }
@@ -516,6 +604,36 @@ async fn collect_object_stream_bounded(result: GetResult, maximum: usize) -> Res
 
 #[async_trait]
 impl ArchiveStore for ObjectArchiveStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>> {
+        let root = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.prefix)
+        };
+        let mut stream = self.inner.list(Some(&self.key(prefix)));
+        let mut out = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            let key = meta.location.to_string();
+            let key = key.strip_prefix(&root).unwrap_or(&key).to_owned();
+            if key.starts_with(prefix) {
+                out.push(Listed {
+                    key,
+                    size: meta.size as u64,
+                    modified: meta.last_modified.into(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match self.inner.delete(&self.key(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let result = self.inner.get(&self.key(key)).await?;
         Ok(result.bytes().await?.to_vec())

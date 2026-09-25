@@ -18,6 +18,7 @@ use fossil_codec::head::{
     MAX_HEAD, MAX_LEVELS,
 };
 pub use fossil_codec::head::{L0_TRIGGER, MAX_L0_BACKLOG};
+use futures_util::TryStreamExt;
 use moka::sync::Cache;
 use sha3::{Digest, Keccak256};
 use std::collections::{HashMap, HashSet};
@@ -413,6 +414,101 @@ pub struct Reader<'a> {
     head_digest: Hash32,
     runs: Vec<(Run, RunReader)>,
     shards: Cache<String, Arc<Shard>>,
+}
+
+/// Outcome of one garbage-collection pass.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct GcReport {
+    pub live_objects: usize,
+    pub deleted_objects: usize,
+    pub deleted_bytes: u64,
+    /// Unreachable objects kept because they are younger than the grace age.
+    pub kept_young: usize,
+}
+
+/// Delete immutable objects unreachable from the current head: superseded runs'
+/// pages, fences, roots and summary shards, plus head copies beyond the newest
+/// `keep_heads`. Only objects older than `min_age` are deleted, and nothing is
+/// deleted if the head changes during the pass.
+///
+/// Run with publishers and compactors stopped: a writer can re-reference an old
+/// unreachable object by content address, which a concurrent sweep could delete.
+/// Readers pinned to a superseded head may fail once its runs are gone.
+pub async fn collect_garbage(
+    store: &dyn ArchiveStore,
+    chain_id: u64,
+    keep_heads: usize,
+    min_age: std::time::Duration,
+    dry_run: bool,
+) -> Result<GcReport> {
+    let started = std::time::SystemTime::now();
+    let (before, head) = read_head(store, chain_id)
+        .await?
+        .context("missing tiered head")?;
+    let mut live = HashSet::new();
+    for run in head.runs() {
+        let (root, bytes) = run.input()?;
+        live.insert(root.digest.object_key());
+        let refs = RunReader::decode(root, &bytes)?
+            .object_refs(|reference| fetch(store, reference))
+            .await?;
+        live.extend(
+            refs.into_iter()
+                .map(|reference| reference.digest.object_key()),
+        );
+        for kind in [ShardKind::Address, ShardKind::Spill] {
+            live.extend(
+                (0..run.shards).map(|index| shard_path(run.root.digest, run.shards, kind, index)),
+            );
+        }
+    }
+    let mut parent = head.parent;
+    for _ in 0..keep_heads {
+        let Some(reference) = parent else { break };
+        let key = reference.digest.object_key();
+        let Ok(bytes) = store.get_bounded(&key, MAX_HEAD).await else {
+            break;
+        };
+        live.insert(key);
+        parent = serde_json::from_slice::<Head>(&bytes)
+            .ok()
+            .and_then(|head| head.parent);
+    }
+    let cutoff = started - min_age;
+    let mut report = GcReport {
+        live_objects: live.len(),
+        ..GcReport::default()
+    };
+    let mut doomed = Vec::new();
+    for listed in [
+        store.list("objects/").await?,
+        store.list("summaries/").await?,
+    ]
+    .concat()
+    {
+        if live.contains(&listed.key) {
+            continue;
+        }
+        if listed.modified > cutoff {
+            report.kept_young += 1;
+            continue;
+        }
+        report.deleted_objects += 1;
+        report.deleted_bytes += listed.size;
+        doomed.push(listed.key);
+    }
+    let (after, _) = read_head(store, chain_id)
+        .await?
+        .context("tiered head vanished")?;
+    if after.bytes != before.bytes {
+        bail!("tiered head changed during garbage collection; stop writers and retry");
+    }
+    if !dry_run {
+        futures_util::stream::iter(doomed.into_iter().map(Ok::<_, anyhow::Error>))
+            .try_for_each_concurrent(32, |key| async move { store.delete(&key).await })
+            .await?;
+    }
+    Ok(report)
 }
 
 /// Hard per-request resource limits, charged with each object's maximum size
@@ -866,6 +962,63 @@ mod tests {
                 block
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_keeps_every_read_and_frees_superseded_runs() -> Result<()> {
+        let store = MemoryArchiveStore::default();
+        let address = Address([0x11; 20]);
+        let slot = h(2);
+        publish(&store, &anchor(address, slot)?, &gate(0, h(1))).await?;
+        let mut parent = h(1);
+        for n in 1..=40 {
+            let package = delta(n, parent, h(1), address, slot);
+            parent = package.segment.blocks[0].hash;
+            publish(&store, &package, &gate(n, parent)).await?;
+            drain(&store).await?;
+        }
+        let before = store.list("").await?.len();
+        let zero = std::time::Duration::ZERO;
+        let dry = collect_garbage(&store, 1, 2, zero, true).await?;
+        assert!(dry.deleted_objects > 0);
+        assert_eq!(store.list("").await?.len(), before);
+        let report = collect_garbage(&store, 1, 2, zero, false).await?;
+        assert_eq!(report.deleted_objects, dry.deleted_objects);
+        assert_eq!(store.list("").await?.len(), before - report.deleted_objects);
+        let reader = Reader::open(&store, 1).await?;
+        for block in 0..=40 {
+            assert_eq!(
+                reader.account(address, block).await?.unwrap().incarnation,
+                block
+            );
+            assert_eq!(
+                reader.code(address, block).await?.len(),
+                if block == 0 { 0 } else { 2 }
+            );
+            let expected = if block == 0 { 1 } else { 0 };
+            assert_eq!(reader.storage(address, slot, block).await?[31], expected);
+        }
+        assert_eq!(
+            collect_garbage(&store, 1, 2, zero, false)
+                .await?
+                .deleted_objects,
+            0
+        );
+        // Writers keep working on the collected store.
+        let package = delta(41, parent, h(1), address, slot);
+        let hash = package.segment.blocks[0].hash;
+        publish(&store, &package, &gate(41, hash)).await?;
+        drain(&store).await?;
+        assert_eq!(
+            Reader::open(&store, 1)
+                .await?
+                .account(address, 41)
+                .await?
+                .unwrap()
+                .nonce,
+            41
+        );
         Ok(())
     }
 
