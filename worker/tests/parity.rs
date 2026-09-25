@@ -2,11 +2,11 @@
 //! store on disk; the Worker core must answer every query exactly like the
 //! native reader, within its request budget.
 
-use fossil::tiered::PublicationGate;
 use fossil::format::{Address, Hash32};
 use fossil::normalized::read_package;
 use fossil::store::open_store;
 use fossil::tiered;
+use fossil::tiered::PublicationGate;
 use fossil_worker::core::{ArchiveError, ObjectStore, Reader, Result};
 use sha3::{Digest, Keccak256};
 use std::cell::Cell;
