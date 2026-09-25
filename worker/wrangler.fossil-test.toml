@@ -1,0 +1,19 @@
+# Test deployment over the fossil-test bucket's tiered v1 export. Deploy with
+# `npx wrangler deploy --config wrangler.fossil-test.toml`; it never touches the
+# production `fossil-r2-gateway` Worker or the `fossil` bucket.
+name = "fossil-test-tiered-gateway"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-02-24"
+workers_dev = true
+preview_urls = false
+
+[build]
+command = "worker-build --release --no-panic-recovery"
+
+[vars]
+IMMUTABLE_PREFIX = "tiered-v1-export-20260924/"
+CHAIN_ID = "8453"
+
+[[r2_buckets]]
+binding = "ARCHIVE"
+bucket_name = "fossil-test"
