@@ -555,6 +555,10 @@ impl<'a> Reader<'a> {
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
+    /// Uncompacted L0 runs in the pinned head.
+    pub fn l0_count(&self) -> usize {
+        self.head.l0.len()
+    }
     pub fn chain_id(&self) -> u64 {
         self.head.chain_id
     }

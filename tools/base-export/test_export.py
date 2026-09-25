@@ -57,7 +57,7 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "big").write_bytes(b"x" * 10)
             export.enforce_cap(Path(tmp), 10)
-            with self.assertRaisesRegex(ValueError, "exceeds the cap"):
+            with self.assertRaisesRegex(export.CapReached, "exceeds the cap"):
                 export.enforce_cap(Path(tmp), 9)
 
     def test_invalid_replay_never_installs_package(self):

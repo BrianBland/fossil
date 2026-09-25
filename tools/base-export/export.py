@@ -220,9 +220,14 @@ def workspace_size(root):
     return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
 
 
+class CapReached(Exception):
+    """A byte cap was reached; the export stops cleanly (exit 0) to be resumed later."""
+
+
 def enforce_cap(root, cap):
     size = workspace_size(root)
-    require(size <= cap, f"STOPPED: {size} local workspace bytes exceeds the cap")
+    if size > cap:
+        raise CapReached(f"STOPPED: {size} local workspace bytes exceeds the cap")
     return size
 
 
@@ -307,7 +312,8 @@ def main():
             enforce_cap(args.workspace, args.cap_bytes)
             if not args.dry_run and args.store.startswith("s3://") and remote_checked % REMOTE_CHECK_EPOCHS == 0:
                 size = remote_bytes(args.store)
-                require(size <= args.cap_bytes, f"STOPPED: remote prefix holds {size} bytes")
+                if size > args.cap_bytes:
+                    raise CapReached(f"STOPPED: remote prefix holds {size} bytes")
                 print(f"REMOTE_BYTES {size}", flush=True)
             remote_checked += 1
             db.execute("BEGIN IMMEDIATE")
@@ -333,4 +339,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CapReached as stop:
+        print(stop, flush=True)

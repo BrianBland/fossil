@@ -308,9 +308,10 @@ async fn verify(args: StoreArgs) -> Result<()> {
     let store = open(&args).await?;
     let reader = tiered::Reader::open(store.as_ref(), chain_id).await?;
     println!(
-        "verified tiered head through {} with {} runs, head sha256 {} (objects verify on read; this is not a full-history audit)",
+        "verified tiered head through {} with {} runs ({} L0), head sha256 {} (objects verify on read; this is not a full-history audit)",
         reader.latest_block(),
         reader.run_count(),
+        reader.l0_count(),
         reader.head_digest()
     );
     Ok(())
