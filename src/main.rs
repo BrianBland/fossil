@@ -221,6 +221,7 @@ async fn compact(args: CompactArgs) -> Result<()> {
         let mut commits = 0;
         while tiered::compact_once(store.as_ref(), chain_id).await? {
             commits += 1;
+            tracing::info!(commits, "compaction committed");
         }
         if commits > 0 {
             tracing::info!(commits, "compacted L0 runs");

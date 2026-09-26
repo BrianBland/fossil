@@ -7,6 +7,7 @@ use crate::summary::SummaryBuilder;
 use anyhow::{anyhow, bail, Result};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -15,6 +16,14 @@ const IN_FLIGHT: usize = 32;
 /// Total data pages a merge may hold ahead of its scanners.
 const READ_AHEAD_PAGES: usize = 768;
 const FETCH_CONCURRENCY: usize = 64;
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct Progress {
+    records: AtomicU64,
+    uploaded: AtomicU64,
+}
 
 /// A written run: every data, index, root and summary object is durable.
 #[derive(Clone, Debug)]
@@ -52,6 +61,8 @@ async fn next(scanner: &mut RunScanner, store: &dyn ArchiveStore) -> Result<Opti
 // of encoded pages worst case); make it configurable if compactor RAM matters.
 struct ReadAhead<'a> {
     store: &'a dyn ArchiveStore,
+    /// Pages fetched so far (progress reporting).
+    pages: AtomicU64,
     /// Page digest -> (list, position) in `lists`.
     order: HashMap<Hash32, (usize, usize)>,
     lists: Vec<Vec<ObjectRef>>,
@@ -91,6 +102,7 @@ impl<'a> ReadAhead<'a> {
             .max(1);
         Ok(Self {
             store,
+            pages: AtomicU64::new(0),
             order,
             depth: (READ_AHEAD_PAGES / busy).clamp(2, 32),
             state: Mutex::new(AheadState {
@@ -142,6 +154,8 @@ impl<'a> ReadAhead<'a> {
             .buffer_unordered(FETCH_CONCURRENCY)
             .try_collect()
             .await?;
+        self.pages
+            .fetch_add(fetched.len() as u64, Ordering::Relaxed);
         let position = fetched
             .iter()
             .position(|(page, _)| page.digest == reference.digest)
@@ -209,6 +223,10 @@ pub async fn merge_runs(
     }
     let read_ahead = ReadAhead::new(store, &readers).await?;
     let read_ahead = &read_ahead;
+    let progress = Progress::default();
+    let progress = &progress;
+    let built_count = std::sync::Arc::new(AtomicU64::new(0));
+    let built_counter = built_count.clone();
     let mut scanners: Vec<RunScanner> = readers.iter().map(RunReader::scanner).collect();
     let (records_tx, mut records_rx) = mpsc::channel::<Record>(IN_FLIGHT);
     let (objects_tx, objects_rx) = mpsc::channel(IN_FLIGHT);
@@ -221,6 +239,7 @@ pub async fn merge_runs(
             if object.bytes.len() < 4096 {
                 root_bytes.clone_from(&object.bytes);
             }
+            built_counter.fetch_add(1, Ordering::Relaxed);
             objects_tx
                 .blocking_send(object)
                 .map_err(|_| anyhow!("compaction object uploader stopped"))
@@ -255,6 +274,7 @@ pub async fn merge_runs(
             let Some(index) = chosen else { break };
             let record = heads[index].take().unwrap();
             heads[index] = scanners[index].next(|page| read_ahead.get(page)).await?;
+            progress.records.fetch_add(1, Ordering::Relaxed);
             if last_key.as_deref() != Some(record.key.as_slice()) {
                 summary.add(&record.key);
                 last_key = Some(record.key.clone());
@@ -276,10 +296,53 @@ pub async fn merge_runs(
     .try_for_each_concurrent(IN_FLIGHT, |object| async move {
         store
             .put_immutable(&object.object_key(), &object.bytes)
-            .await
+            .await?;
+        progress.uploaded.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     });
 
-    let (produced, built, uploaded) = tokio::join!(producer, builder, uploads);
+    // Log progress, and abandon a merge that makes none for STALL_LIMIT (the
+    // compactor then exits and its supervisor restarts it).
+    let watchdog = async {
+        let mut last = (u64::MAX, 0, 0, 0);
+        let mut idle = std::time::Duration::ZERO;
+        loop {
+            tokio::time::sleep(PROGRESS_INTERVAL).await;
+            let now = (
+                read_ahead.pages.load(Ordering::Relaxed),
+                progress.records.load(Ordering::Relaxed),
+                built_count.load(Ordering::Relaxed),
+                progress.uploaded.load(Ordering::Relaxed),
+            );
+            tracing::info!(
+                pages = now.0,
+                records = now.1,
+                objects_built = now.2,
+                objects_uploaded = now.3,
+                "merge progress"
+            );
+            idle = if now == last {
+                idle + PROGRESS_INTERVAL
+            } else {
+                Default::default()
+            };
+            if idle >= STALL_LIMIT {
+                return anyhow!(
+                    "merge stalled for {idle:?} (pages={}, records={}, built={}, uploaded={})",
+                    now.0,
+                    now.1,
+                    now.2,
+                    now.3
+                );
+            }
+            last = now;
+        }
+    };
+    let work = async { tokio::join!(producer, builder, uploads) };
+    let (produced, built, uploaded) = tokio::select! {
+        done = work => done,
+        stalled = watchdog => return Err(stalled),
+    };
     let summary = produced?;
     let (root, root_bytes) = built??;
     uploaded?;
