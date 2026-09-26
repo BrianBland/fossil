@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Replay Base from genesis into bounded fossil-export/1 packages and append them to a tiered v1 archive."""
 import argparse
+import collections
 import concurrent.futures
+import itertools
 import json
 import os
 import re
@@ -10,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -26,6 +29,8 @@ QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
 MAX_BYTES = 5_000_000_000  # decimal GB, for both the local workspace and the remote prefix
 REMOTE_CHECK_EPOCHS = 25
 BACKLOG_RETRY_SECONDS = 10
+# Converted packages allowed to wait for publication.
+SPOOL_DEPTH = 2
 
 
 def require(condition, message):
@@ -136,37 +141,47 @@ def replay_chunk(first, last, replay, datadir, directory):
 
 
 def parallel_replay(first, last, replay, datadir, directory):
+    """Replay blocks in order with at most REPLAY_WORKERS chunks running and a
+    bounded number finished ahead, across package boundaries."""
     with tempfile.TemporaryDirectory(prefix=".fossil-replay-", dir=directory) as temp:
         temp = Path(temp)
         with concurrent.futures.ThreadPoolExecutor(max_workers=REPLAY_WORKERS) as pool:
-            chunks = [pool.submit(replay_chunk, start, min(start + REPLAY_CHUNK - 1, last),
-                                  replay, datadir, temp)
-                      for start in range(first, last + 1, REPLAY_CHUNK)]
-            for job in chunks:
-                with job.result().open() as file:
+            starts = iter(range(first, last + 1, REPLAY_CHUNK))
+            pending = collections.deque()
+            def submit():
+                start = next(starts, None)
+                if start is not None:
+                    pending.append(pool.submit(replay_chunk, start,
+                                               min(start + REPLAY_CHUNK - 1, last),
+                                               replay, datadir, temp))
+            for _ in range(REPLAY_WORKERS * 2):
+                submit()
+            while pending:
+                path = pending.popleft().result()
+                submit()
+                with path.open() as file:
                     yield from file
+                path.unlink()
 
 
-def convert(first, last, db, destination, endpoint, replay, datadir):
+def preceding_hash(endpoint, first):
     previous = rpc(endpoint, "eth_getBlockByNumber", [hex(first - 1), False])
     require(type(previous) is dict and int(previous["number"], 16) == first - 1,
             "missing preceding canonical Base block")
-    parent = hex_value(previous["hash"], HASH)
+    return hex_value(previous["hash"], HASH)
+
+
+def convert(first, last, db, destination, parent, lines):
+    """Write blocks first..last from the ordered replay stream `lines`; returns the end hash."""
     seen_code = set()
     fd, temporary = tempfile.mkstemp(prefix=".native-export-", dir=destination.parent)
-    lines = None
     try:
         with os.fdopen(fd, "w") as out:
             line(out, {"type": "header", "schema": "fossil-export/1", "chain_id": "0x2105",
                        "genesis_hash": GENESIS, "mode": "delta", "preceding_number": hex(first - 1),
                        "preceding_hash": parent})
-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-            require(hard >= 65_536, "read-only Reth requires a nofile hard limit of at least 65536")
-            if soft < 65_536:
-                resource.setrlimit(resource.RLIMIT_NOFILE, (65_536, hard))
-            lines = parallel_replay(first, last, replay, datadir, destination.parent)
             count = 0
-            for raw in lines:
+            for raw in itertools.islice(lines, last - first + 1):
                 block = decode(raw)
                 number = first + count
                 validate_block(block, number, parent)
@@ -209,15 +224,23 @@ def convert(first, last, db, destination, endpoint, replay, datadir):
             out.flush()
             os.fsync(out.fileno())
         os.replace(temporary, destination)
+        return parent
     finally:
-        if lines is not None:
-            lines.close()
         if os.path.exists(temporary):
             os.unlink(temporary)
 
 
 def workspace_size(root):
-    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+    """Bytes under root; files removed concurrently (published packages, consumed
+    replay chunks) are skipped."""
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            pass
+    return total
 
 
 class CapReached(Exception):
@@ -272,6 +295,82 @@ def publish(fossil, store, package, last, end_hash):
         raise RuntimeError(f"fossil archive failed: {result.stderr.strip()[-2000:]}")
 
 
+def head_number(fossil, store):
+    """Published tiered head block number."""
+    result = subprocess.run([str(fossil), "verify", "--store", store, "--chain-id", "0x2105"],
+                            capture_output=True, text=True, timeout=600, env=fossil_env())
+    require(result.returncode == 0, f"fossil verify failed: {result.stderr.strip()[-500:]}")
+    match = re.search(r"through (\d+) ", result.stdout)
+    require(match is not None, "unexpected fossil verify output")
+    return int(match.group(1))
+
+
+class Publisher:
+    """Publishes spooled packages in order on a background thread, so replay and
+    conversion of later packages overlap run building, uploads and the head CAS.
+    At most SPOOL_DEPTH converted packages wait on disk."""
+
+    def __init__(self, fossil, store, spooled):
+        self.fossil, self.store = fossil, store
+        self.slots = threading.Semaphore(SPOOL_DEPTH)
+        self.queue = collections.deque()
+        self.ready = threading.Condition()
+        self.error = None
+        self.closed = False
+        for package in spooled:
+            self.slots.acquire()
+            self.queue.append(package)
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def check(self):
+        if self.error is not None:
+            raise RuntimeError("background publication failed") from self.error
+
+    def reserve(self):
+        while not self.slots.acquire(timeout=1):
+            self.check()
+        self.check()
+
+    def submit(self, package):
+        with self.ready:
+            self.queue.append(package)
+            self.ready.notify()
+
+    def finish(self):
+        with self.ready:
+            self.closed = True
+            self.ready.notify()
+        while self.thread.is_alive():
+            self.thread.join(timeout=1)
+        self.check()
+
+    def close(self):
+        with self.ready:
+            self.closed = True
+            self.ready.notify()
+
+    def run(self):
+        try:
+            while True:
+                with self.ready:
+                    while not self.queue and not self.closed:
+                        self.ready.wait()
+                    if not self.queue:
+                        return
+                    package = self.queue[0]
+                last = int(package.stem.split("-")[1])
+                end_hash = json.loads(package.read_text().splitlines()[-1])["end_hash"]
+                publish(self.fossil, self.store, package, last, end_hash)
+                package.unlink()
+                with self.ready:
+                    self.queue.popleft()
+                self.slots.release()
+                print(f"EXPORT_COMPLETE through={last}", flush=True)
+        except BaseException as error:  # surfaced to the converter via check()
+            self.error = error
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--first", required=True, type=int)
@@ -306,34 +405,63 @@ def main():
         # Genesis accounts start at incarnation zero; the block-zero anchor is published first.
         require((head is None and args.first == 1) or (head is not None and head[0] == args.first - 1),
                 "incarnation journal does not precede batch")
+        journal = head[0] if head else 0
+        spooled = sorted(args.workspace.glob("*-*.jsonl"), key=lambda p: int(p.name.split("-")[0]))
+        if not args.dry_run:
+            # Journal commits run ahead of publication; the spool holds the gap.
+            published = head_number(args.fossil, args.store)
+            covered = published
+            for package in spooled:
+                start, end = (int(x) for x in package.stem.split("-"))
+                if end <= published:
+                    package.unlink()  # published before a crash, not yet removed
+                    continue
+                require(start == covered + 1, f"spool gap before {package.name}")
+                covered = end
+            require(covered == journal, "spool does not cover the journal beyond the head")
+            spooled = [p for p in spooled if p.exists()]
+        publisher = None if args.dry_run else Publisher(args.fossil, args.store, spooled)
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        require(hard >= 65_536, "read-only Reth requires a nofile hard limit of at least 65536")
+        if soft < 65_536:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (65_536, hard))
+        lines = parallel_replay(args.first, args.last, args.replay, args.datadir, args.workspace)
+        parent = preceding_hash(args.rpc, args.first)
         remote_checked = 0
-        for first in range(args.first, args.last + 1, 1000):
-            last = min(first + 999, args.last)
-            enforce_cap(args.workspace, args.cap_bytes)
-            if not args.dry_run and args.store.startswith("s3://") and remote_checked % REMOTE_CHECK_EPOCHS == 0:
-                size = remote_bytes(args.store)
-                if size > args.cap_bytes:
-                    raise CapReached(f"STOPPED: remote prefix holds {size} bytes")
-                print(f"REMOTE_BYTES {size}", flush=True)
-            remote_checked += 1
-            db.execute("BEGIN IMMEDIATE")
-            package = args.workspace / f"{first}-{last}.jsonl"
-            try:
-                convert(first, last, db, package, args.rpc, args.replay, args.datadir)
+        try:
+            for first in range(args.first, args.last + 1, 1000):
+                last = min(first + 999, args.last)
                 enforce_cap(args.workspace, args.cap_bytes)
-                print(f"PREPARED {first}..{last} bytes={package.stat().st_size}", flush=True)
-                if args.dry_run:
+                if not args.dry_run and args.store.startswith("s3://") and remote_checked % REMOTE_CHECK_EPOCHS == 0:
+                    size = remote_bytes(args.store)
+                    if size > args.cap_bytes:
+                        raise CapReached(f"STOPPED: remote prefix holds {size} bytes")
+                    print(f"REMOTE_BYTES {size}", flush=True)
+                remote_checked += 1
+                if publisher:
+                    publisher.reserve()
+                db.execute("BEGIN IMMEDIATE")
+                package = args.workspace / f"{first}-{last}.jsonl"
+                try:
+                    parent = convert(first, last, db, package, parent, lines)
+                    enforce_cap(args.workspace, args.cap_bytes)
+                    print(f"PREPARED {first}..{last} bytes={package.stat().st_size}", flush=True)
+                    if args.dry_run:
+                        db.rollback()
+                        return
+                    db.execute("INSERT OR REPLACE INTO meta VALUES ('last_block', ?)", (last,))
+                    db.commit()
+                except Exception:
                     db.rollback()
-                    return
-                end_hash = json.loads(package.read_text().splitlines()[-1])["end_hash"]
-                publish(args.fossil, args.store, package, last, end_hash)
-                db.execute("INSERT OR REPLACE INTO meta VALUES ('last_block', ?)", (last,))
-                db.commit()
-                package.unlink()
-                print(f"EXPORT_COMPLETE through={last}", flush=True)
-            except Exception:
-                db.rollback()
-                raise
+                    package.unlink(missing_ok=True)
+                    raise
+                publisher.submit(package)
+            if publisher:
+                publisher.finish()
+        finally:
+            lines.close()
+            if publisher:
+                publisher.close()
     finally:
         db.close()
 

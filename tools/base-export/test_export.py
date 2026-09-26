@@ -61,16 +61,10 @@ class LifecycleTests(unittest.TestCase):
                 export.enforce_cap(Path(tmp), 9)
 
     def test_invalid_replay_never_installs_package(self):
-        class Process:
-            stdout = io.StringIO("not a replay block\n")
-            def poll(self):
-                return 0
         with tempfile.TemporaryDirectory() as tmp:
             package = Path(tmp) / "one.jsonl"
-            with patch.object(export, "rpc", return_value={"number": "0x0", "hash": HASH}), \
-                 patch.object(export.subprocess, "Popen", return_value=Process()):
-                with self.assertRaises(ValueError):
-                    export.convert(1, 1, self.db, package, "http://localhost", Path("probe"), Path("data"))
+            with self.assertRaises(ValueError):
+                export.convert(1, 1, self.db, package, HASH, iter(["not a replay block\n"]))
             self.assertFalse(package.exists())
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
@@ -97,36 +91,72 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(blocks, list(range(1, 1001)))
         self.assertTrue(2 <= peak <= export.REPLAY_WORKERS)
 
-    def test_main_publishes_and_advances_journal(self):
-        published = []
-
+    def run_main(self, root, first, last, head, published, fail=False):
         def fake_publish(_fossil, store, package, last, end_hash):
+            if fail:
+                raise RuntimeError("R2 down")
             if not package.exists():
-                raise AssertionError("staged package is missing")
-            published.append((package.name, store, last, end_hash))
+                raise AssertionError("spooled package is missing")
+            published.append((package.name, last, end_hash))
 
         def fake_rpc(_endpoint, method, _params):
             return {"eth_chainId": "0x2105", "eth_syncing": False,
-                    "eth_getBlockByNumber": {"number": "0x1"}}[method]
+                    "eth_getBlockByNumber": {"number": "0x100000"}}[method]
 
-        def fake_convert(_first, _last, _db, package, *_args):
+        def fake_convert(first, last, _db, package, _parent, _lines):
             package.write_text('{}\n{"type":"trailer","end_hash":"%s"}\n' % HASH)
+            return HASH
 
+        arguments = ["export.py", "--first", str(first), "--last", str(last),
+                     "--workspace", str(root), "--datadir", str(root), "--replay", str(root),
+                     "--fossil", str(root), "--rpc", "http://localhost", "--store", "file:///x"]
+        with patch.object(sys, "argv", arguments), patch.object(export, "rpc", fake_rpc), \
+             patch.object(export, "publish", fake_publish), \
+             patch.object(export, "head_number", return_value=head), \
+             patch.object(export, "preceding_hash", return_value=HASH), \
+             patch.object(export, "parallel_replay", lambda *a: (x for x in ())), \
+             patch.object(export, "convert", fake_convert):
+            export.main()
+
+    def test_main_publishes_in_order_and_advances_journal(self):
+        published = []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".fossil-replay-stale").mkdir()
             (root / ".native-export-stale").write_text("partial")
-            arguments = ["export.py", "--first", "1", "--last", "1",
-                         "--workspace", tmp, "--datadir", tmp, "--replay", tmp,
-                         "--fossil", tmp, "--rpc", "http://localhost", "--store", "file:///x"]
-            with patch.object(sys, "argv", arguments), patch.object(export, "rpc", fake_rpc), \
-                 patch.object(export, "publish", fake_publish), \
-                 patch.object(export, "convert", fake_convert):
-                export.main()
-            self.assertEqual(published, [("1-1.jsonl", "file:///x", 1, HASH)])
+            self.run_main(root, 1, 2500, 0, published)
+            self.assertEqual([name for name, _, _ in published],
+                             ["1-1000.jsonl", "1001-2000.jsonl", "2001-2500.jsonl"])
             self.assertEqual(sorted(p.name for p in root.iterdir()), ["lifetimes.sqlite"])
             with sqlite3.connect(root / "lifetimes.sqlite") as db:
-                self.assertEqual(db.execute("SELECT value FROM meta WHERE key='last_block'").fetchone(), (1,))
+                self.assertEqual(db.execute("SELECT value FROM meta WHERE key='last_block'").fetchone(), (2500,))
+
+    def test_restart_publishes_spooled_packages_first(self):
+        published = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with sqlite3.connect(root / "lifetimes.sqlite") as db:
+                db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+                db.execute("INSERT INTO meta VALUES ('last_block', 3000)")
+            trailer = '{}\n{"type":"trailer","end_hash":"%s"}\n' % HASH
+            (root / "1-1000.jsonl").write_text(trailer)       # published, not yet removed
+            (root / "1001-2000.jsonl").write_text(trailer)    # converted, not published
+            (root / "2001-3000.jsonl").write_text(trailer)
+            self.run_main(root, 3001, 3500, 1000, published)
+            self.assertEqual([name for name, _, _ in published],
+                             ["1001-2000.jsonl", "2001-3000.jsonl", "3001-3500.jsonl"])
+            # A head behind the journal with no spooled packages cannot resume.
+            with self.assertRaisesRegex(ValueError, "spool does not cover"):
+                self.run_main(root, 3501, 4000, 2000, [])
+
+    def test_background_publication_failure_stops_the_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(RuntimeError, "background publication failed"):
+                self.run_main(root, 1, 9000, 0, [], fail=True)
+            # The journal ran ahead only as far as the durable spool allows.
+            spooled = sorted(p.name for p in root.glob("*-*.jsonl"))
+            self.assertLessEqual(len(spooled), export.SPOOL_DEPTH + 1)
 
     def test_publish_waits_out_compaction_backlog(self):
         class Result:
