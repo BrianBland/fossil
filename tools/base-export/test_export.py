@@ -142,6 +142,7 @@ class LifecycleTests(unittest.TestCase):
             (root / "1-1000.jsonl").write_text(trailer)       # published, not yet removed
             (root / "1001-2000.jsonl").write_text(trailer)    # converted, not published
             (root / "2001-3000.jsonl").write_text(trailer)
+            (root / "3001-4000.jsonl").write_text(trailer)    # converted, journal rolled back
             self.run_main(root, 3001, 3500, 1000, published)
             self.assertEqual([name for name, _, _ in published],
                              ["1001-2000.jsonl", "2001-3000.jsonl", "3001-3500.jsonl"])

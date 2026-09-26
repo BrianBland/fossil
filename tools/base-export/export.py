@@ -413,8 +413,10 @@ def main():
             covered = published
             for package in spooled:
                 start, end = (int(x) for x in package.stem.split("-"))
-                if end <= published:
-                    package.unlink()  # published before a crash, not yet removed
+                if end <= published or end > journal:
+                    # Published but not yet removed, or converted but never
+                    # committed to the journal (its lifetimes were rolled back).
+                    package.unlink()
                     continue
                 require(start == covered + 1, f"spool gap before {package.name}")
                 covered = end
