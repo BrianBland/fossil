@@ -330,7 +330,7 @@ pub async fn publish(
     bail!("tiered publication lost too many CAS races")
 }
 
-/// Fold the oldest `L0_TRIGGER` L0 runs (cascading through full levels) into one
+/// Fold the oldest L0 runs, in groups of `L0_TRIGGER` (cascading through full levels), into one
 /// run with a single streaming k-way merge. Returns whether a head was committed.
 /// Safe to run concurrently with `publish`, which only appends L0 runs.
 pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<bool> {
@@ -341,7 +341,17 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
         return Ok(false);
     }
     let mut levels = planned.levels.clone();
-    let mut weight = L0_TRIGGER as u64;
+    // Under backlog, fold several groups of L0_TRIGGER runs in one merge (as many
+    // as level 0 can absorb), so level 0 is rewritten once instead of per group.
+    let level0 = levels
+        .first()
+        .and_then(Option::as_ref)
+        .map_or(0, |run| run.weight);
+    let groups = (planned.l0.len() / L0_TRIGGER)
+        .min(((unit(0) * FANOUT - level0) / L0_TRIGGER as u64) as usize)
+        .max(1);
+    let take = groups * L0_TRIGGER;
+    let mut weight = take as u64;
     let mut deeper = Vec::new();
     let mut target = 0;
     loop {
@@ -366,7 +376,7 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
     let inputs: Vec<Run> = deeper
         .into_iter()
         .rev()
-        .chain(planned.l0[..L0_TRIGGER].iter().cloned())
+        .chain(planned.l0[..take].iter().cloned())
         .collect();
     if inputs
         .windows(2)
@@ -397,11 +407,11 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
         let (bytes, current) = read_head(store, chain_id)
             .await?
             .context("tiered head vanished")?;
-        if current.levels != planned.levels || !current.l0.starts_with(&planned.l0[..L0_TRIGGER]) {
+        if current.levels != planned.levels || !current.l0.starts_with(&planned.l0[..take]) {
             bail!("tiered head changed incompatibly during compaction");
         }
         let next = Head {
-            l0: current.l0[L0_TRIGGER..].to_vec(),
+            l0: current.l0[take..].to_vec(),
             levels: levels.clone(),
             ..current
         };
@@ -970,8 +980,11 @@ mod tests {
         let hash = blocked.segment.blocks[0].hash;
         let error = publish(&store, &blocked, &gate(n, hash)).await.unwrap_err();
         assert!(error.to_string().contains("backlog"));
-        drain(&store).await?;
-        assert_eq!(head(&store).await?.l0.len(), 0);
+        // One merge folds the whole 16-run backlog into the empty level 0.
+        assert!(compact_once(&store, 1).await?);
+        let folded = head(&store).await?;
+        assert_eq!(folded.l0.len(), 0);
+        assert_eq!(folded.levels[0].as_ref().unwrap().weight, 16);
         publish(&store, &blocked, &gate(n, hash)).await?;
         parent = hash;
         for n in n + 1..=170 {
