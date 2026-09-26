@@ -585,6 +585,10 @@ pub async fn collect_garbage(
     }
     let deleted = futures_util::stream::iter(doomed.into_iter().map(Ok::<_, anyhow::Error>))
         .map_ok(|listed| async move {
+            if dry_run {
+                // An estimate: skip the per-object age re-check a real sweep does.
+                return Ok(Some(listed.size));
+            }
             let fresh = store
                 .modified(&listed.key)
                 .await?
@@ -592,9 +596,7 @@ pub async fn collect_garbage(
             if fresh {
                 return Ok(None);
             }
-            if !dry_run {
-                store.delete(&listed.key).await?;
-            }
+            store.delete(&listed.key).await?;
             Ok::<_, anyhow::Error>(Some(listed.size))
         })
         .try_buffer_unordered(32)

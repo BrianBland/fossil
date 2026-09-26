@@ -113,6 +113,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(sys, "argv", arguments), patch.object(export, "rpc", fake_rpc), \
              patch.object(export, "publish", fake_publish), \
              patch.object(export, "head_number", return_value=head), \
+             patch.object(export, "live_bytes", return_value=0), \
              patch.object(export, "preceding_hash", return_value=HASH), \
              patch.object(export, "parallel_replay", lambda *a: (x for x in ())), \
              patch.object(export, "convert", fake_convert):

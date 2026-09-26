@@ -14,7 +14,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -27,7 +26,8 @@ ADDRESS = re.compile(r"0x[0-9a-f]{40}\Z")
 HASH = re.compile(r"0x[0-9a-f]{64}\Z")
 QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
 MAX_BYTES = 5_000_000_000  # decimal GB, for both the local workspace and the remote prefix
-REMOTE_CHECK_EPOCHS = 25
+# How often to measure the archive's resting (live) size against the cap.
+LIVE_CHECK_SECONDS = 600
 BACKLOG_RETRY_SECONDS = 10
 CAP_RETRY_SECONDS = 900
 # Converted packages allowed to wait for publication.
@@ -255,18 +255,14 @@ def enforce_cap(root, cap):
     return size
 
 
-def remote_bytes(store):
-    """Total bytes under an s3:// store prefix (superseded compaction output included)."""
-    import boto3
-    url = urllib.parse.urlparse(store)
-    prefix = url.path.strip("/") + "/"
-    s3 = boto3.client("s3", endpoint_url=os.environ["CF_S3_API_ENDPOINT"], region_name="auto",
-                      aws_access_key_id=os.environ["CF_ACCESS_KEY_ID"],
-                      aws_secret_access_key=os.environ["CF_SECRET_ACCESS_KEY"])
-    total = 0
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=url.netloc, Prefix=prefix):
-        total += sum(obj["Size"] for obj in page.get("Contents", []))
-    return total
+def live_bytes(fossil, store):
+    """Bytes reachable from the head: the archive's size once GC has run. The
+    bucket briefly holds more (superseded compaction output within GC's grace)."""
+    result = subprocess.run([str(fossil), "gc", "--store", store, "--chain-id", "0x2105",
+                             "--dry-run"], capture_output=True, text=True, timeout=1800,
+                            env=fossil_env())
+    require(result.returncode == 0, f"fossil gc --dry-run failed: {result.stderr.strip()[-500:]}")
+    return json.loads(result.stdout)["live_bytes"]
 
 
 def fossil_env():
@@ -432,17 +428,18 @@ def main():
             resource.setrlimit(resource.RLIMIT_NOFILE, (65_536, hard))
         lines = parallel_replay(args.first, args.last, args.replay, args.datadir, args.workspace)
         parent = preceding_hash(args.rpc, args.first)
-        remote_checked = 0
+        checked_at = None
         try:
             for first in range(args.first, args.last + 1, 1000):
                 last = min(first + 999, args.last)
                 enforce_cap(args.workspace, args.cap_bytes)
-                if not args.dry_run and args.store.startswith("s3://") and remote_checked % REMOTE_CHECK_EPOCHS == 0:
-                    size = remote_bytes(args.store)
-                    if size > args.cap_bytes:
-                        raise CapReached(f"STOPPED: remote prefix holds {size} bytes")
-                    print(f"REMOTE_BYTES {size}", flush=True)
-                remote_checked += 1
+                if not args.dry_run and (checked_at is None
+                                         or time.monotonic() - checked_at > LIVE_CHECK_SECONDS):
+                    checked_at = time.monotonic()
+                    live = live_bytes(args.fossil, args.store)
+                    print(f"LIVE_BYTES {live}", flush=True)
+                    if live > args.cap_bytes:
+                        raise CapReached(f"STOPPED: archive holds {live} live bytes")
                 if publisher:
                     publisher.reserve()
                 db.execute("BEGIN IMMEDIATE")
