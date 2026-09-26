@@ -24,7 +24,7 @@ pub struct VersionedBytes {
 
 /// An identical object that already exists is re-written (same bytes) when it is
 /// older than this, so garbage collection's age check sees it as freshly used.
-pub const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+pub const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 fn stale(modified: SystemTime) -> bool {
     modified.elapsed().is_ok_and(|age| age > REFRESH_AFTER)

@@ -8,6 +8,7 @@
 
 use crate::Hash32;
 use anyhow::{bail, Context, Result};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use std::collections::VecDeque;
 use std::io::Read;
 #[cfg(feature = "build")]
@@ -24,6 +25,7 @@ const MAX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 512 * 1024;
 const ROOT_BYTES: usize = 4 + 1 + PARTITIONS * 36;
 const REF_BYTES: usize = 36;
+const WALK_CONCURRENCY: usize = 32;
 
 /// An archive-compatible reference: SHA-256 of exact encoded bytes and exact length.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -196,7 +198,7 @@ impl RunReader {
     /// leaves and data pages. Walks only index objects; data pages are never fetched.
     pub async fn object_refs<F, Fut>(&self, fetch: F) -> Result<Vec<ObjectRef>>
     where
-        F: FnMut(ObjectRef) -> Fut,
+        F: Fn(ObjectRef) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>>>,
     {
         let (mut refs, pages) = self.walk(fetch).await?;
@@ -207,40 +209,59 @@ impl RunReader {
     /// Data page references per partition, in the order a scanner reads them.
     pub async fn data_pages<F, Fut>(&self, fetch: F) -> Result<Vec<Vec<ObjectRef>>>
     where
-        F: FnMut(ObjectRef) -> Fut,
+        F: Fn(ObjectRef) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>>>,
     {
         Ok(self.walk(fetch).await?.1)
     }
 
-    /// Index objects, then data pages grouped by partition in scan order.
-    async fn walk<F, Fut>(&self, mut fetch: F) -> Result<(Vec<ObjectRef>, Vec<Vec<ObjectRef>>)>
+    /// Index objects, then data pages grouped by partition in scan order. Fence
+    /// roots, then all fence leaves, are fetched concurrently (at most
+    /// WALK_CONCURRENCY at a time) so large runs do not pay one round trip each.
+    async fn walk<F, Fut>(&self, fetch: F) -> Result<(Vec<ObjectRef>, Vec<Vec<ObjectRef>>)>
     where
-        F: FnMut(ObjectRef) -> Fut,
+        F: Fn(ObjectRef) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<u8>>>,
     {
-        let mut refs = Vec::new();
-        let mut pages = vec![Vec::new(); PARTITIONS];
-        for (shard, root) in self.indexes.iter().enumerate() {
-            if *root == ObjectRef::default() {
-                continue;
-            }
+        let roots: Vec<(usize, ObjectRef)> = self
+            .indexes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, root)| *root != ObjectRef::default())
+            .collect();
+        for (_, root) in &roots {
             validate_index_ref(*root)?;
-            refs.push(*root);
-            let bytes = fetch(*root).await.context("fetch run fence root")?;
-            let leaves = if bytes.starts_with(INTERNAL_MAGIC) {
-                let mut leaves = Vec::new();
-                for parent in decode_index(*root, &bytes, shard, INTERNAL_MAGIC)? {
+        }
+        let root_bytes: Vec<Vec<u8>> = stream::iter(roots.iter().map(|(_, root)| fetch(*root)))
+            .buffered(WALK_CONCURRENCY)
+            .try_collect()
+            .await
+            .context("fetch run fence root")?;
+        let mut refs: Vec<ObjectRef> = roots.iter().map(|(_, root)| *root).collect();
+        let mut pages = vec![Vec::new(); PARTITIONS];
+        // (partition, leaf reference) for every internal root's children, in order.
+        let mut leaves = Vec::new();
+        for ((shard, root), bytes) in roots.iter().zip(&root_bytes) {
+            if bytes.starts_with(INTERNAL_MAGIC) {
+                for parent in decode_index(*root, bytes, *shard, INTERNAL_MAGIC)? {
                     validate_index_ref(parent.data)?;
-                    refs.push(parent.data);
-                    let leaf = fetch(parent.data).await.context("fetch run fence leaf")?;
-                    leaves.extend(decode_index(parent.data, &leaf, shard, INDEX_MAGIC)?);
+                    leaves.push((*shard, parent.data));
                 }
-                leaves
             } else {
-                decode_index(*root, &bytes, shard, INDEX_MAGIC)?
-            };
-            pages[shard].extend(leaves.into_iter().map(|fence| fence.data));
+                let fences = decode_index(*root, bytes, *shard, INDEX_MAGIC)?;
+                pages[*shard].extend(fences.into_iter().map(|fence| fence.data));
+            }
+        }
+        let leaf_bytes: Vec<Vec<u8>> = stream::iter(leaves.iter().map(|(_, leaf)| fetch(*leaf)))
+            .buffered(WALK_CONCURRENCY)
+            .try_collect()
+            .await
+            .context("fetch run fence leaf")?;
+        for ((shard, leaf), bytes) in leaves.iter().zip(&leaf_bytes) {
+            refs.push(*leaf);
+            let fences = decode_index(*leaf, bytes, *shard, INDEX_MAGIC)?;
+            pages[*shard].extend(fences.into_iter().map(|fence| fence.data));
         }
         Ok((refs, pages))
     }

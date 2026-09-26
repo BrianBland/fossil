@@ -330,7 +330,7 @@ pub async fn publish(
     bail!("tiered publication lost too many CAS races")
 }
 
-/// Fold the oldest `L0_TRIGGER` L0 runs (cascading through full levels) into one
+/// Fold the oldest L0 runs, in groups of `L0_TRIGGER` (cascading through full levels), into one
 /// run with a single streaming k-way merge. Returns whether a head was committed.
 /// Safe to run concurrently with `publish`, which only appends L0 runs.
 pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<bool> {
@@ -341,7 +341,17 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
         return Ok(false);
     }
     let mut levels = planned.levels.clone();
-    let mut weight = L0_TRIGGER as u64;
+    // Under backlog, fold several groups of L0_TRIGGER runs in one merge (as many
+    // as level 0 can absorb), so level 0 is rewritten once instead of per group.
+    let level0 = levels
+        .first()
+        .and_then(Option::as_ref)
+        .map_or(0, |run| run.weight);
+    let groups = (planned.l0.len() / L0_TRIGGER)
+        .min(((unit(0) * FANOUT - level0) / L0_TRIGGER as u64) as usize)
+        .max(1);
+    let take = groups * L0_TRIGGER;
+    let mut weight = take as u64;
     let mut deeper = Vec::new();
     let mut target = 0;
     loop {
@@ -366,7 +376,7 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
     let inputs: Vec<Run> = deeper
         .into_iter()
         .rev()
-        .chain(planned.l0[..L0_TRIGGER].iter().cloned())
+        .chain(planned.l0[..take].iter().cloned())
         .collect();
     if inputs
         .windows(2)
@@ -376,11 +386,14 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
     }
     let refs = inputs.iter().map(Run::input).collect::<Result<Vec<_>>>()?;
     let expected: u64 = inputs.iter().map(|run| run.keys).sum();
-    let merge_started = std::time::Instant::now();
-    let built = merge_runs(store, &refs, expected).await?;
-    if merge_started.elapsed() > MERGE_DEADLINE {
-        bail!("compaction exceeded its deadline; its output is left for garbage collection");
-    }
+    // The lease tells garbage collection how old this merge's unreferenced output
+    // may get; the deadline bounds that age (and turns a hang into a restart).
+    write_lease(store, chain_id).await?;
+    let built = tokio::time::timeout(MERGE_DEADLINE, merge_runs(store, &refs, expected))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("compaction exceeded its deadline; output left for garbage collection")
+        })??;
     levels[target] = Some(new_run(
         inputs[0].start,
         inputs.last().unwrap().end,
@@ -394,15 +407,16 @@ pub async fn compact_once(store: &dyn ArchiveStore, chain_id: u64) -> Result<boo
         let (bytes, current) = read_head(store, chain_id)
             .await?
             .context("tiered head vanished")?;
-        if current.levels != planned.levels || !current.l0.starts_with(&planned.l0[..L0_TRIGGER]) {
+        if current.levels != planned.levels || !current.l0.starts_with(&planned.l0[..take]) {
             bail!("tiered head changed incompatibly during compaction");
         }
         let next = Head {
-            l0: current.l0[L0_TRIGGER..].to_vec(),
+            l0: current.l0[take..].to_vec(),
             levels: levels.clone(),
             ..current
         };
         if swap(store, Some(&bytes), next).await.is_ok() {
+            store.delete(&lease_key(chain_id)).await?;
             return Ok(true);
         }
     }
@@ -424,6 +438,8 @@ pub struct Reader<'a> {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct GcReport {
     pub live_objects: usize,
+    /// Bytes of listed objects reachable from the head (the resting archive size).
+    pub live_bytes: u64,
     pub deleted_objects: usize,
     pub deleted_bytes: u64,
     /// Unreachable objects kept because they are younger than the grace age.
@@ -431,12 +447,45 @@ pub struct GcReport {
 }
 
 /// Default age below which garbage collection never deletes an object. It must
-/// exceed `MERGE_DEADLINE` (unreferenced in-flight output) and
+/// exceed the longest publication (build, upload, head CAS) and
 /// `store::REFRESH_AFTER` (writers re-stamp reused objects older than that).
-pub const GC_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
-/// A compaction slower than this abandons its output rather than commit objects
-/// that garbage collection may already consider old.
-const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+/// In-flight compaction output is protected separately by the compaction lease.
+pub const GC_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// A compaction slower than this is abandoned (its output is left for GC), which
+/// also bounds how long a lease can protect unreferenced objects.
+const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90 * 60);
+
+fn lease_key(chain_id: u64) -> String {
+    format!("chains/{chain_id}/heads/compaction-lease.json")
+}
+
+/// Record that a merge started now: GC must spare objects written since then.
+async fn write_lease(store: &dyn ArchiveStore, chain_id: u64) -> Result<()> {
+    let key = lease_key(chain_id);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let current = store.read_mutable_bounded(&key, 1024).await?;
+    store
+        .compare_and_swap(&key, current.as_ref(), started.to_string().as_bytes())
+        .await
+}
+
+/// Start of a live (not yet past its deadline) compaction, if any.
+async fn active_lease(
+    store: &dyn ArchiveStore,
+    chain_id: u64,
+) -> Result<Option<std::time::SystemTime>> {
+    let Some(lease) = store
+        .read_mutable_bounded(&lease_key(chain_id), 1024)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let started = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(std::str::from_utf8(&lease.bytes)?.trim().parse()?);
+    Ok((started.elapsed().unwrap_or_default() < MERGE_DEADLINE).then_some(started))
+}
 
 /// Keys of every object reachable from `head`, plus its newest `keep_heads` copies.
 async fn reachable(
@@ -481,7 +530,8 @@ async fn reachable(
 /// Delete immutable objects unreachable from the head: superseded runs' pages,
 /// fences, roots and summary shards, plus head copies beyond the newest
 /// `keep_heads`. Safe alongside publishers and compactors:
-/// - objects younger than `min_age` (in-flight output) are never deleted;
+/// - objects younger than `min_age` (in-flight publication output) are never
+///   deleted, nor anything written since an active compaction lease began;
 /// - objects reachable from the head read *after* listing are kept too;
 /// - each candidate's age is re-checked immediately before deletion, and writers
 ///   re-stamp any old identical object they reuse (`store::REFRESH_AFTER`).
@@ -512,7 +562,11 @@ pub async fn collect_garbage(
         .await?
         .context("tiered head vanished")?;
     reachable(store, &head, keep_heads, &mut live).await?;
-    let cutoff = started - min_age;
+    let mut cutoff = started - min_age;
+    if let Some(lease) = active_lease(store, chain_id).await? {
+        // Spare everything an in-flight merge may have uploaded (1 min of clock skew).
+        cutoff = cutoff.min(lease - std::time::Duration::from_secs(60));
+    }
     let mut report = GcReport {
         live_objects: live.len(),
         ..GcReport::default()
@@ -520,6 +574,7 @@ pub async fn collect_garbage(
     let mut doomed = Vec::new();
     for listed in listed {
         if live.contains(&listed.key) {
+            report.live_bytes += listed.size;
             continue;
         }
         if listed.modified > cutoff {
@@ -928,8 +983,11 @@ mod tests {
         let hash = blocked.segment.blocks[0].hash;
         let error = publish(&store, &blocked, &gate(n, hash)).await.unwrap_err();
         assert!(error.to_string().contains("backlog"));
-        drain(&store).await?;
-        assert_eq!(head(&store).await?.l0.len(), 0);
+        // One merge folds the whole 16-run backlog into the empty level 0.
+        assert!(compact_once(&store, 1).await?);
+        let folded = head(&store).await?;
+        assert_eq!(folded.l0.len(), 0);
+        assert_eq!(folded.levels[0].as_ref().unwrap().weight, 16);
         publish(&store, &blocked, &gate(n, hash)).await?;
         parent = hash;
         for n in n + 1..=170 {
@@ -1126,6 +1184,25 @@ mod tests {
                 block
             );
         }
+        // A long merge's output is older than the grace period but newer than its
+        // active lease, so it survives until the lease is gone.
+        let merge_output = Hash32::digest(b"long merge page").object_key();
+        store
+            .put_immutable(&merge_output, b"long merge page")
+            .await?;
+        age(&merge_output, std::time::SystemTime::now() - 2 * GC_MIN_AGE)?;
+        let lease_started = std::time::SystemTime::now() - 3 * GC_MIN_AGE;
+        let seconds = lease_started
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        store
+            .compare_and_swap(&lease_key(1), None, seconds.to_string().as_bytes())
+            .await?;
+        collect_garbage(store, 1, 0, GC_MIN_AGE, false).await?;
+        assert!(store.modified(&merge_output).await?.is_some());
+        store.delete(&lease_key(1)).await?;
+        collect_garbage(store, 1, 0, GC_MIN_AGE, false).await?;
+        assert!(store.modified(&merge_output).await?.is_none());
         Ok(())
     }
 

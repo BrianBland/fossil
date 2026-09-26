@@ -38,11 +38,11 @@ export CF_SECRET_ACCESS_KEY=your-secret-key
   --fossil "$(pwd)/target/release/fossil" --rpc "$BASE_RPC" --store "$STORE"
 ```
 
-Add `--dry-run` to convert one epoch and roll back the journal without writing. Each epoch contains at most 1,000 blocks and 100,000,000 normalized bytes. The local workspace and, every 25 epochs, the remote prefix (including superseded compaction output, which is not yet garbage-collected) must stay at or below `--cap-bytes` (default 5,000,000,000); exceeding either stops the export.
+The exporter stops at the node's finalized head (the node may be catching up at its tip). At a byte cap it prints `STOPPED`, waits 15 minutes for garbage collection and exits cleanly for its supervisor to restart it. Add `--dry-run` to convert one epoch and roll back the journal without writing. Each epoch contains at most 1,000 blocks and 100,000,000 normalized bytes. The local workspace and, every 25 epochs, the remote prefix (including superseded compaction output, which is not yet garbage-collected) must stay at or below `--cap-bytes` (default 5,000,000,000); exceeding either stops the export.
 
-Resumption is safe after a crash: the journal commits only after `fossil archive` succeeds, and re-publishing the same package is idempotent. Keep exactly one exporter per store; the compactor may run concurrently. This trusts Reth replay and finality RPC, not independent `state_root` reconstruction.
+The exporter is a pipeline: read-only replay runs continuously across package boundaries (at most eight concurrent 125-block chunks, sixteen buffered), conversion writes each 1,000-block package, and a background publisher runs `fossil archive` (run build, uploads, head CAS) for the previous package while the next one converts. At most two converted packages wait in the workspace spool.
 
-Read-only replay uses at most eight concurrent 125-block chunks, then emits blocks in order.
+Resumption is safe after a crash. A package is fsynced to the spool before the journal commits it, so the journal may run ahead of the published head only by spooled packages; on start the exporter republishes them in order (identical re-publication is idempotent) and refuses to run if the spool does not cover the gap. Keep exactly one exporter per store; the compactor and `fossil gc` may run concurrently. This trusts Reth replay and finality RPC, not independent `state_root` reconstruction.
 
 ## Measure
 

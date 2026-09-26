@@ -31,4 +31,5 @@ zstd = "0.13"
 
 [profile.release]
 lto = "thin"
-strip = true
+# Keep symbols and line tables so a stuck production process can be stack-traced.
+debug = "line-tables-only"
