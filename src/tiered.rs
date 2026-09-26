@@ -438,6 +438,8 @@ pub struct Reader<'a> {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct GcReport {
     pub live_objects: usize,
+    /// Bytes of listed objects reachable from the head (the resting archive size).
+    pub live_bytes: u64,
     pub deleted_objects: usize,
     pub deleted_bytes: u64,
     /// Unreachable objects kept because they are younger than the grace age.
@@ -572,6 +574,7 @@ pub async fn collect_garbage(
     let mut doomed = Vec::new();
     for listed in listed {
         if live.contains(&listed.key) {
+            report.live_bytes += listed.size;
             continue;
         }
         if listed.modified > cutoff {
