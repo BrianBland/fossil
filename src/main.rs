@@ -68,8 +68,8 @@ struct GcArgs {
     /// Also keep this many predecessor head copies (audit history).
     #[arg(long, default_value_t = 16)]
     keep_heads: usize,
-    /// Never delete objects modified more recently than this (default 3 hours;
-    /// must exceed the compaction deadline and the writer refresh age).
+    /// Never delete objects modified more recently than this (default 15
+    /// minutes; must exceed the longest publication and the writer refresh age).
     #[arg(long, default_value_t = tiered::GC_MIN_AGE.as_secs())]
     min_age_seconds: u64,
     /// Report what would be deleted without deleting.
@@ -221,6 +221,7 @@ async fn compact(args: CompactArgs) -> Result<()> {
         let mut commits = 0;
         while tiered::compact_once(store.as_ref(), chain_id).await? {
             commits += 1;
+            tracing::info!(commits, "compaction committed");
         }
         if commits > 0 {
             tracing::info!(commits, "compacted L0 runs");

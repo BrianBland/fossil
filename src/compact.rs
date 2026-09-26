@@ -5,14 +5,25 @@ use crate::run::{ObjectRef, Record, RunBuilder, RunReader, RunScanner};
 use crate::store::ArchiveStore;
 use crate::summary::SummaryBuilder;
 use anyhow::{anyhow, bail, Result};
-use futures_util::{stream, TryStreamExt};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 const PAGE_LIMIT: usize = 1024 * 1024;
 const IN_FLIGHT: usize = 32;
-const READ_AHEAD: usize = 8;
+/// Total data pages a merge may hold ahead of its scanners.
+const READ_AHEAD_PAGES: usize = 768;
+const FETCH_CONCURRENCY: usize = 64;
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct Progress {
+    records: AtomicU64,
+    uploaded: AtomicU64,
+}
 
 /// A written run: every data, index, root and summary object is durable.
 #[derive(Clone, Debug)]
@@ -42,63 +53,120 @@ async fn next(scanner: &mut RunScanner, store: &dyn ArchiveStore) -> Result<Opti
     scanner.next(|reference| fetch(store, reference)).await
 }
 
-/// Data pages fetched ahead of each partition's scanner. A merge is otherwise
-/// bound by one sequential R2 round trip per page.
-// ponytail: memory is READ_AHEAD pages per run partition (about 16 * runs *
-// READ_AHEAD MiB worst case); spawn background fetches if batching stops sufficing.
+/// Data pages fetched ahead of every partition scanner. A merge reads all of
+/// each run's partitions in order and at similar rates (keys are hash-routed),
+/// so on any miss the reader tops up every partition that is running low in one
+/// concurrent batch. Without this a merge waits on one R2 round trip per page.
+// ponytail: at most READ_AHEAD_PAGES pages are buffered in total (about 256 MiB
+// of encoded pages worst case); make it configurable if compactor RAM matters.
 struct ReadAhead<'a> {
     store: &'a dyn ArchiveStore,
+    /// Pages fetched so far (progress reporting).
+    pages: AtomicU64,
     /// Page digest -> (list, position) in `lists`.
     order: HashMap<Hash32, (usize, usize)>,
     lists: Vec<Vec<ObjectRef>>,
-    ready: Mutex<HashMap<Hash32, Vec<u8>>>,
+    /// Pages kept ahead of the last request, per list.
+    depth: usize,
+    state: Mutex<AheadState>,
+}
+
+struct AheadState {
+    ready: HashMap<Hash32, Vec<u8>>,
+    /// Next page per list that has not been fetched.
+    fetched: Vec<usize>,
+    /// Position of the latest request per list.
+    wanted: Vec<usize>,
 }
 
 impl<'a> ReadAhead<'a> {
     async fn new(store: &'a dyn ArchiveStore, readers: &[RunReader]) -> Result<Self> {
-        let mut lists = Vec::new();
-        for reader in readers {
-            lists.extend(
-                reader
-                    .data_pages(|reference| fetch(store, reference))
-                    .await?,
-            );
-        }
+        let lists: Vec<Vec<ObjectRef>> = futures_util::future::try_join_all(
+            readers
+                .iter()
+                .map(|reader| reader.data_pages(|reference| fetch(store, reference))),
+        )
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
         let mut order = HashMap::new();
         for (list, pages) in lists.iter().enumerate() {
             for (position, page) in pages.iter().enumerate() {
                 order.entry(page.digest).or_insert((list, position));
             }
         }
+        let busy = lists
+            .iter()
+            .filter(|pages| !pages.is_empty())
+            .count()
+            .max(1);
         Ok(Self {
             store,
+            pages: AtomicU64::new(0),
             order,
+            depth: (READ_AHEAD_PAGES / busy).clamp(2, 32),
+            state: Mutex::new(AheadState {
+                ready: HashMap::new(),
+                fetched: vec![0; lists.len()],
+                wanted: vec![0; lists.len()],
+            }),
             lists,
-            ready: Mutex::new(HashMap::new()),
         })
     }
 
     async fn get(&self, reference: ObjectRef) -> Result<Vec<u8>> {
-        if let Some(bytes) = self.ready.lock().unwrap().remove(&reference.digest) {
-            return Ok(bytes);
-        }
-        let Some(&(list, position)) = self.order.get(&reference.digest) else {
+        let planned = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(bytes) = state.ready.remove(&reference.digest) {
+                if let Some(&(list, position)) = self.order.get(&reference.digest) {
+                    state.wanted[list] = state.wanted[list].max(position);
+                }
+                return Ok(bytes);
+            }
+            self.order.get(&reference.digest).map(|&(list, position)| {
+                state.wanted[list] = state.wanted[list].max(position);
+                state.fetched[list] = state.fetched[list].max(position);
+                let mut batch = vec![reference];
+                for (index, pages) in self.lists.iter().enumerate() {
+                    let start = state.fetched[index];
+                    let end = pages.len().min(state.wanted[index] + 1 + self.depth);
+                    // Only top up lists that have used at least half of their lead.
+                    if start < end && (index == list || end - start > self.depth / 2) {
+                        batch.extend(
+                            pages[start..end]
+                                .iter()
+                                .filter(|page| page.digest != reference.digest),
+                        );
+                        state.fetched[index] = end;
+                    }
+                }
+                batch
+            })
+        };
+        // Not a data page (for example a fence object): fetch it directly.
+        let Some(batch) = planned else {
             return fetch(self.store, reference).await;
         };
-        let batch: Vec<ObjectRef> = self.lists[list][position..]
+        let mut fetched: Vec<(ObjectRef, Vec<u8>)> =
+            futures_util::stream::iter(batch.into_iter().map(|page| async move {
+                Ok::<_, anyhow::Error>((page, fetch(self.store, page).await?))
+            }))
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+        self.pages
+            .fetch_add(fetched.len() as u64, Ordering::Relaxed);
+        let position = fetched
             .iter()
-            .take(READ_AHEAD)
-            .copied()
-            .collect();
-        let fetched =
-            futures_util::future::try_join_all(batch.iter().map(|page| fetch(self.store, *page)))
-                .await?;
-        let mut fetched = batch.into_iter().zip(fetched);
-        let (_, first) = fetched.next().expect("batch starts with the request");
-        self.ready
-            .lock()
-            .unwrap()
-            .extend(fetched.map(|(page, bytes)| (page.digest, bytes)));
+            .position(|(page, _)| page.digest == reference.digest)
+            .expect("batch contains the request");
+        let (_, first) = fetched.swap_remove(position);
+        self.state.lock().unwrap().ready.extend(
+            fetched
+                .into_iter()
+                .map(|(page, bytes)| (page.digest, bytes)),
+        );
         Ok(first)
     }
 }
@@ -156,6 +224,10 @@ pub async fn merge_runs(
     }
     let read_ahead = ReadAhead::new(store, &readers).await?;
     let read_ahead = &read_ahead;
+    let progress = Progress::default();
+    let progress = &progress;
+    let built_count = std::sync::Arc::new(AtomicU64::new(0));
+    let built_counter = built_count.clone();
     let mut scanners: Vec<RunScanner> = readers.iter().map(RunReader::scanner).collect();
     let (records_tx, mut records_rx) = mpsc::channel::<Record>(IN_FLIGHT);
     let (objects_tx, objects_rx) = mpsc::channel(IN_FLIGHT);
@@ -168,6 +240,7 @@ pub async fn merge_runs(
             if object.bytes.len() < 4096 {
                 root_bytes.clone_from(&object.bytes);
             }
+            built_counter.fetch_add(1, Ordering::Relaxed);
             objects_tx
                 .blocking_send(object)
                 .map_err(|_| anyhow!("compaction object uploader stopped"))
@@ -202,6 +275,7 @@ pub async fn merge_runs(
             let Some(index) = chosen else { break };
             let record = heads[index].take().unwrap();
             heads[index] = scanners[index].next(|page| read_ahead.get(page)).await?;
+            progress.records.fetch_add(1, Ordering::Relaxed);
             if last_key.as_deref() != Some(record.key.as_slice()) {
                 summary.add(&record.key);
                 last_key = Some(record.key.clone());
@@ -223,10 +297,53 @@ pub async fn merge_runs(
     .try_for_each_concurrent(IN_FLIGHT, |object| async move {
         store
             .put_immutable(&object.object_key(), &object.bytes)
-            .await
+            .await?;
+        progress.uploaded.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     });
 
-    let (produced, built, uploaded) = tokio::join!(producer, builder, uploads);
+    // Log progress, and abandon a merge that makes none for STALL_LIMIT (the
+    // compactor then exits and its supervisor restarts it).
+    let watchdog = async {
+        let mut last = (u64::MAX, 0, 0, 0);
+        let mut idle = std::time::Duration::ZERO;
+        loop {
+            tokio::time::sleep(PROGRESS_INTERVAL).await;
+            let now = (
+                read_ahead.pages.load(Ordering::Relaxed),
+                progress.records.load(Ordering::Relaxed),
+                built_count.load(Ordering::Relaxed),
+                progress.uploaded.load(Ordering::Relaxed),
+            );
+            tracing::info!(
+                pages = now.0,
+                records = now.1,
+                objects_built = now.2,
+                objects_uploaded = now.3,
+                "merge progress"
+            );
+            idle = if now == last {
+                idle + PROGRESS_INTERVAL
+            } else {
+                Default::default()
+            };
+            if idle >= STALL_LIMIT {
+                return anyhow!(
+                    "merge stalled for {idle:?} (pages={}, records={}, built={}, uploaded={})",
+                    now.0,
+                    now.1,
+                    now.2,
+                    now.3
+                );
+            }
+            last = now;
+        }
+    };
+    let work = async { tokio::join!(producer, builder, uploads) };
+    let (produced, built, uploaded) = tokio::select! {
+        done = work => done,
+        stalled = watchdog => return Err(stalled),
+    };
     let summary = produced?;
     let (root, root_bytes) = built??;
     uploaded?;
