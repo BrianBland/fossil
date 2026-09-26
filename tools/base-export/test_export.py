@@ -91,7 +91,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(blocks, list(range(1, 1001)))
         self.assertTrue(2 <= peak <= export.REPLAY_WORKERS)
 
-    def run_main(self, root, first, last, head, published, fail=False):
+    def run_main(self, root, first, last, head, published, fail=False, finalized=0x100000):
         def fake_publish(_fossil, store, package, last, end_hash):
             if fail:
                 raise RuntimeError("R2 down")
@@ -101,7 +101,7 @@ class LifecycleTests(unittest.TestCase):
 
         def fake_rpc(_endpoint, method, _params):
             return {"eth_chainId": "0x2105", "eth_syncing": False,
-                    "eth_getBlockByNumber": {"number": "0x100000"}}[method]
+                    "eth_getBlockByNumber": {"number": hex(finalized)}}[method]
 
         def fake_convert(first, last, _db, package, _parent, _lines):
             package.write_text('{}\n{"type":"trailer","end_hash":"%s"}\n' % HASH)
@@ -130,6 +130,12 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in root.iterdir()), ["lifetimes.sqlite"])
             with sqlite3.connect(root / "lifetimes.sqlite") as db:
                 self.assertEqual(db.execute("SELECT value FROM meta WHERE key='last_block'").fetchone(), (2500,))
+
+    def test_export_stops_at_the_finalized_head(self):
+        published = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(Path(tmp), 1, 50_000_000, 0, published, finalized=2500)
+            self.assertEqual(published[-1][:2], ("2001-2500.jsonl", 2500))
 
     def test_restart_publishes_spooled_packages_first(self):
         published = []

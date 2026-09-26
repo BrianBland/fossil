@@ -29,6 +29,7 @@ QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
 MAX_BYTES = 5_000_000_000  # decimal GB, for both the local workspace and the remote prefix
 REMOTE_CHECK_EPOCHS = 25
 BACKLOG_RETRY_SECONDS = 10
+CAP_RETRY_SECONDS = 900
 # Converted packages allowed to wait for publication.
 SPOOL_DEPTH = 2
 
@@ -388,11 +389,13 @@ def main():
         p.error("expected positive contiguous block range")
     if args.dry_run and args.last - args.first >= 1000:
         p.error("dry-run accepts at most one 1000-block epoch")
-    require(rpc(args.rpc, "eth_chainId", []) == "0x2105"
-            and rpc(args.rpc, "eth_syncing", []) is False, "wrong or syncing Base node")
+    require(rpc(args.rpc, "eth_chainId", []) == "0x2105", "wrong Base node")
+    # Export only finalized history. The node may be catching up at its tip; that
+    # does not affect replay of blocks far below its finalized head.
     finalized = rpc(args.rpc, "eth_getBlockByNumber", ["finalized", False])
-    require(type(finalized) is dict and args.last <= int(finalized["number"], 16),
-            "unfinalized block requested")
+    require(type(finalized) is dict, "Base node has no finalized block")
+    args.last = min(args.last, int(finalized["number"], 16))
+    require(args.first <= args.last, "requested blocks are not finalized yet")
     args.workspace.mkdir(parents=True, exist_ok=True)
     # One exporter per workspace: staging left by a killed run is never resumed.
     for stale in [*args.workspace.glob(".fossil-replay-*"), *args.workspace.glob(".native-export-*")]:
@@ -473,3 +476,5 @@ if __name__ == "__main__":
         main()
     except CapReached as stop:
         print(stop, flush=True)
+        # A supervisor restarts us; wait for GC to reclaim space before retrying.
+        time.sleep(CAP_RETRY_SECONDS)
