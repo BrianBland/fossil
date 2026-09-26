@@ -81,14 +81,15 @@ struct AheadState {
 
 impl<'a> ReadAhead<'a> {
     async fn new(store: &'a dyn ArchiveStore, readers: &[RunReader]) -> Result<Self> {
-        let mut lists = Vec::new();
-        for reader in readers {
-            lists.extend(
-                reader
-                    .data_pages(|reference| fetch(store, reference))
-                    .await?,
-            );
-        }
+        let lists: Vec<Vec<ObjectRef>> = futures_util::future::try_join_all(
+            readers
+                .iter()
+                .map(|reader| reader.data_pages(|reference| fetch(store, reference))),
+        )
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
         let mut order = HashMap::new();
         for (list, pages) in lists.iter().enumerate() {
             for (position, page) in pages.iter().enumerate() {
